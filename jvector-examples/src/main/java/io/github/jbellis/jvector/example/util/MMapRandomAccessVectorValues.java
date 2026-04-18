@@ -16,77 +16,93 @@
 
 package io.github.jbellis.jvector.example.util;
 
-import com.indeed.util.mmap.MMapBuffer;
+import io.github.jbellis.jvector.graph.ByteBufferRandomAccessVectorValues;
 import io.github.jbellis.jvector.graph.RandomAccessVectorValues;
-import io.github.jbellis.jvector.vector.VectorizationProvider;
 import io.github.jbellis.jvector.vector.types.VectorFloat;
-import io.github.jbellis.jvector.vector.types.VectorTypeSupport;
 
 import java.io.Closeable;
 import java.io.File;
 import java.io.IOError;
 import java.io.IOException;
+import java.io.RandomAccessFile;
 import java.nio.ByteOrder;
+import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
 
-public class MMapRandomAccessVectorValues implements RandomAccessVectorValues, Closeable {
-    private static final VectorTypeSupport vectorTypeSupport = VectorizationProvider.getInstance().getVectorTypeSupport();
-    final int dimension;
-    final int rows;
-    final File file;
-    final float[] valueBuffer;
+/**
+ * RAVV backed by a memory-mapped file of contiguous little-endian IEEE 754 floats.
+ *
+ * <p>Unlike the previous implementation — which copied each row into an on-heap
+ * {@code float[dimension]} scratch buffer on every {@link #getVector} call — this version
+ * delegates to {@link ByteBufferRandomAccessVectorValues} over the {@link MappedByteBuffer},
+ * so reads are served directly from the mmap region with no per-call {@code float[]}
+ * allocation.
+ */
+public class MMapRandomAccessVectorValues implements RandomAccessVectorValues, Closeable
+{
+    private final int dimension;
+    private final File file;
+    private final RandomAccessFile raf;
+    private final FileChannel channel;
+    private final ByteBufferRandomAccessVectorValues delegate;
 
-    final MMapBuffer fileReader;
-
-    public MMapRandomAccessVectorValues(File f, int dimension) {
+    public MMapRandomAccessVectorValues(File f, int dimension)
+    {
         assert f != null && f.exists() && f.canRead();
-        assert f.length() % ((long) dimension * Float.BYTES) == 0;
+        long bytesPerVector = (long) dimension * Float.BYTES;
+        assert f.length() % bytesPerVector == 0;
 
         try {
             this.file = f;
-            this.fileReader = new MMapBuffer(f, FileChannel.MapMode.READ_ONLY, ByteOrder.LITTLE_ENDIAN);
             this.dimension = dimension;
-            this.rows = ((int) f.length()) / dimension;
-            this.valueBuffer = new float[dimension];
+            this.raf = new RandomAccessFile(f, "r");
+            this.channel = raf.getChannel();
+            long size = f.length();
+            MappedByteBuffer mapped = channel.map(FileChannel.MapMode.READ_ONLY, 0, size);
+            mapped.order(ByteOrder.LITTLE_ENDIAN);
+            int count = (int) (size / bytesPerVector);
+            this.delegate = new ByteBufferRandomAccessVectorValues(mapped, count, dimension);
         } catch (IOException e) {
             throw new IOError(e);
         }
     }
 
     @Override
-    public int size() {
-        return (int) (file.length() / ((long) dimension * Float.BYTES));
+    public int size()
+    {
+        return delegate.size();
     }
 
     @Override
-    public int dimension() {
+    public int dimension()
+    {
         return dimension;
     }
 
     @Override
-    public VectorFloat<?> getVector(int targetOrd) {
-        long offset = (long) targetOrd * dimension * Float.BYTES;
-        int i = 0;
-        for (long o = offset; o < offset + ((long) dimension * Float.BYTES); o += Float.BYTES, i++)
-            valueBuffer[i] = fileReader.memory().getFloat(o);
-
-        return vectorTypeSupport.createFloatVector(valueBuffer);
+    public VectorFloat<?> getVector(int targetOrd)
+    {
+        return delegate.getVector(targetOrd);
     }
 
     @Override
-    public boolean isValueShared() {
-        return false;
+    public boolean isValueShared()
+    {
+        return delegate.isValueShared();
     }
 
     @Override
-    public RandomAccessVectorValues copy() {
+    public RandomAccessVectorValues copy()
+    {
         return new MMapRandomAccessVectorValues(file, dimension);
     }
 
     @Override
-    public void close() {
+    public void close()
+    {
         try {
-            this.fileReader.close();
+            channel.close();
+            raf.close();
         } catch (IOException e) {
             throw new IOError(e);
         }

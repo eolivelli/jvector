@@ -81,8 +81,13 @@ final public class ArrayVectorFloat implements VectorFloat<float[]>
     @Override
     public void copyFrom(VectorFloat<?> src, int srcOffset, int destOffset, int length)
     {
-        ArrayVectorFloat csrc = (ArrayVectorFloat) src;
-        System.arraycopy(csrc.data, srcOffset, data, destOffset, length);
+        if (src instanceof ArrayVectorFloat) {
+            System.arraycopy(((ArrayVectorFloat) src).data, srcOffset, data, destOffset, length);
+            return;
+        }
+        for (int i = 0; i < length; i++) {
+            data[destOffset + i] = src.get(srcOffset + i);
+        }
     }
 
     @Override

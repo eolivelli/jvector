@@ -24,6 +24,7 @@ import io.github.jbellis.jvector.vector.types.VectorTypeSupport;
 
 import java.io.IOException;
 import java.nio.Buffer;
+import java.nio.ByteBuffer;
 
 /**
  * VectorTypeSupport using MemorySegments.
@@ -43,6 +44,24 @@ public class MemorySegmentVectorProvider implements VectorTypeSupport
     public VectorFloat<?> createFloatVector(int length)
     {
         return new MemorySegmentVectorFloat(length);
+    }
+
+    /**
+     * Zero-copy wrap that returns a MemorySegment-backed view when the buffer's layout matches
+     * the native SIMD contract (little-endian), so {@code FloatVector.fromMemorySegment} can
+     * run on it directly. Big-endian buffers fall through to the base {@link BufferVectorFloat}
+     * view — still zero-copy but dispatched through the Panama polymorphic path.
+     */
+    @Override
+    public VectorFloat<?> wrapFloatVector(ByteBuffer data, int floatOffset, int floatLength)
+    {
+        if (data.order() != java.nio.ByteOrder.LITTLE_ENDIAN) {
+            return VectorTypeSupport.super.wrapFloatVector(data, floatOffset, floatLength);
+        }
+        ByteBuffer dup = data.duplicate().order(data.order());
+        int startByte = data.position() + floatOffset * Float.BYTES;
+        dup.position(startByte).limit(startByte + floatLength * Float.BYTES);
+        return MemorySegmentVectorFloat.wrap(dup);
     }
 
     @Override
