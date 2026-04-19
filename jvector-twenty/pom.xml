@@ -18,8 +18,9 @@
                 <artifactId>maven-compiler-plugin</artifactId>
                 <version>3.11.0</version>
                 <configuration>
-                    <release>22</release>
+                    <release>20</release>
                     <compilerArgs>
+<!--                        <arg>&#45;&#45;enable-preview</arg>-->
                         <arg>--add-modules</arg>
                         <arg>jdk.incubator.vector</arg>
                     </compilerArgs>
@@ -32,6 +33,7 @@
                 <configuration>
                     <skip>false</skip>
                     <argLine>
+                        --enable-preview
                         --add-modules jdk.incubator.vector
                         --enable-native-access=ALL-UNNAMED
                     </argLine>
