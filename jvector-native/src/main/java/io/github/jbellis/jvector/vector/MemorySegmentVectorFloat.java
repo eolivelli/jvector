@@ -145,6 +145,22 @@ final public class MemorySegmentVectorFloat implements VectorFloat<MemorySegment
     }
 
     @Override
+    public VectorFloat<?> subview(int floatOffset, int floatLength)
+    {
+        int len = length();
+        if (floatOffset < 0 || floatLength < 0 || (long) floatOffset + floatLength > len) {
+            throw new IllegalArgumentException(
+                    "subview [" + floatOffset + "," + (floatOffset + floatLength)
+                            + ") out of range for length " + len);
+        }
+        if (floatOffset == 0 && floatLength == len) {
+            return this;
+        }
+        return new MemorySegmentVectorFloat(
+                segment.asSlice((long) floatOffset * Float.BYTES, (long) floatLength * Float.BYTES));
+    }
+
+    @Override
     public void copyFrom(VectorFloat<?> src, int srcOffset, int destOffset, int length)
     {
         if (src instanceof MemorySegmentVectorFloat csrc) {

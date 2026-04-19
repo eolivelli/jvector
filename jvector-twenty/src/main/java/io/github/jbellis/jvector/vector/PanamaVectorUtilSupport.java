@@ -53,6 +53,9 @@ class PanamaVectorUtilSupport implements VectorUtilSupport {
                     (long) offset * Float.BYTES,
                     bv.byteOrder());
         }
+        if (vector instanceof ArraySliceVectorFloat asv) {
+            return FloatVector.fromArray(SPEC, asv.get(), asv.arrayOffset() + offset);
+        }
         return FloatVector.fromArray(SPEC, ((ArrayVectorFloat) vector).get(), offset);
     }
 
@@ -66,6 +69,9 @@ class PanamaVectorUtilSupport implements VectorUtilSupport {
             }
             return FloatVector.fromArray(SPEC, scratch, 0);
         }
+        if (vector instanceof ArraySliceVectorFloat asv) {
+            return FloatVector.fromArray(SPEC, asv.get(), asv.arrayOffset() + offset, indices, indicesOffset);
+        }
         return FloatVector.fromArray(SPEC, ((ArrayVectorFloat)vector).get(), offset, indices, indicesOffset);
     }
 
@@ -75,6 +81,10 @@ class PanamaVectorUtilSupport implements VectorUtilSupport {
                     MemorySegment.ofBuffer(bv.get()),
                     (long) offset * Float.BYTES,
                     bv.byteOrder());
+            return;
+        }
+        if (v instanceof ArraySliceVectorFloat asv) {
+            vector.intoArray(asv.get(), asv.arrayOffset() + offset);
             return;
         }
         vector.intoArray(((ArrayVectorFloat) v).get(), offset);

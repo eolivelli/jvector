@@ -38,6 +38,27 @@ public interface VectorFloat<T> extends Accountable
 
     VectorFloat<T> copy();
 
+    /**
+     * Return a view over a contiguous sub-range of this vector. The default implementation
+     * materializes a new owned vector via {@link VectorTypeSupport#createFloatVector(int)}
+     * plus {@link #copyFrom}; concrete subtypes that can share storage (on-heap arrays,
+     * ByteBuffers, MemorySegments) override this to return a zero-copy view.
+     *
+     * <p>Used, for example, by Product Quantization training to extract per-subspace
+     * sub-vectors without materializing {@code M × N × (dim/M)} extra floats.
+     */
+    default VectorFloat<?> subview(int floatOffset, int floatLength) {
+        if (floatOffset < 0 || floatLength < 0 || (long) floatOffset + floatLength > length()) {
+            throw new IllegalArgumentException(
+                    "subview [" + floatOffset + "," + (floatOffset + floatLength)
+                    + ") out of range for length " + length());
+        }
+        VectorFloat<?> out = io.github.jbellis.jvector.vector.VectorizationProvider.getInstance()
+                .getVectorTypeSupport().createFloatVector(floatLength);
+        out.copyFrom(this, floatOffset, 0, floatLength);
+        return out;
+    }
+
     void copyFrom(VectorFloat<?> src, int srcOffset, int destOffset, int length);
 
     float get(int i);

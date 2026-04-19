@@ -176,6 +176,15 @@ public final class BufferVectorFloat implements VectorFloat<ByteBuffer>
     }
 
     @Override
+    public VectorFloat<?> subview(int floatOffset, int floatLength)
+    {
+        if (floatOffset == 0 && floatLength == this.floatLength) {
+            return this;
+        }
+        return new BufferVectorFloat(data, floatOffset, floatLength);
+    }
+
+    @Override
     public void copyFrom(VectorFloat<?> src, int srcOffset, int destOffset, int length)
     {
         if (src instanceof BufferVectorFloat bsrc && bsrc.byteOrder() == this.byteOrder()) {
