@@ -38,8 +38,8 @@ final class NativeVectorUtilSupport extends PanamaVectorUtilSupport
 
     @Override
     protected FloatVector fromVectorFloat(VectorSpecies<Float> SPEC, VectorFloat<?> vector, int offset) {
-        if (vector instanceof MemorySegmentVectorFloat) {
-            return FloatVector.fromMemorySegment(SPEC, ((MemorySegmentVectorFloat) vector).get(), vector.offset(offset), ByteOrder.LITTLE_ENDIAN);
+        if (vector instanceof MemorySegmentVectorFloat msv) {
+            return FloatVector.fromMemorySegment(SPEC, msv.get(), vector.offset(offset), ByteOrder.LITTLE_ENDIAN);
         }
         return super.fromVectorFloat(SPEC, vector, offset);
     }
@@ -54,8 +54,8 @@ final class NativeVectorUtilSupport extends PanamaVectorUtilSupport
 
     @Override
     protected void intoVectorFloat(FloatVector vector, VectorFloat<?> v, int offset) {
-        if (v instanceof MemorySegmentVectorFloat) {
-            vector.intoMemorySegment(((MemorySegmentVectorFloat) v).get(), v.offset(offset), ByteOrder.LITTLE_ENDIAN);
+        if (v instanceof MemorySegmentVectorFloat msv) {
+            vector.intoMemorySegment(msv.get(), v.offset(offset), ByteOrder.LITTLE_ENDIAN);
             return;
         }
         super.intoVectorFloat(vector, v, offset);
@@ -63,16 +63,16 @@ final class NativeVectorUtilSupport extends PanamaVectorUtilSupport
 
     @Override
     protected ByteVector fromByteSequence(VectorSpecies<Byte> SPEC, ByteSequence<?> vector, int offset) {
-        if (vector instanceof MemorySegmentByteSequence) {
-            return ByteVector.fromMemorySegment(SPEC, ((MemorySegmentByteSequence) vector).get(), offset, ByteOrder.LITTLE_ENDIAN);
+        if (vector instanceof MemorySegmentByteSequence msb) {
+            return ByteVector.fromMemorySegment(SPEC, msb.get(), offset, ByteOrder.LITTLE_ENDIAN);
         }
         return super.fromByteSequence(SPEC, vector, offset);
     }
 
     @Override
     protected void intoByteSequence(ByteVector vector, ByteSequence<?> v, int offset) {
-        if (v instanceof MemorySegmentByteSequence) {
-            vector.intoMemorySegment(((MemorySegmentByteSequence) v).get(), offset, ByteOrder.LITTLE_ENDIAN);
+        if (v instanceof MemorySegmentByteSequence msb) {
+            vector.intoMemorySegment(msb.get(), offset, ByteOrder.LITTLE_ENDIAN);
             return;
         }
         super.intoByteSequence(vector, v, offset);
@@ -80,8 +80,8 @@ final class NativeVectorUtilSupport extends PanamaVectorUtilSupport
 
     @Override
     protected void intoByteSequence(ByteVector vector, ByteSequence<?> v, int offset, VectorMask<Byte> mask) {
-        if (v instanceof MemorySegmentByteSequence) {
-            vector.intoMemorySegment(((MemorySegmentByteSequence) v).get(), offset, ByteOrder.LITTLE_ENDIAN, mask);
+        if (v instanceof MemorySegmentByteSequence msb) {
+            vector.intoMemorySegment(msb.get(), offset, ByteOrder.LITTLE_ENDIAN, mask);
             return;
         }
         super.intoByteSequence(vector, v, offset, mask);

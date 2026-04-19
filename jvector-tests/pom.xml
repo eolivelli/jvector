@@ -175,25 +175,5 @@
                 <skipSIMD>false</skipSIMD>
             </properties>
         </profile>
-        <profile>
-            <id>jdk20</id>
-            <dependencies>
-                <dependency>
-                    <groupId>io.github.jbellis</groupId>
-                    <artifactId>jvector-twenty</artifactId>
-                    <version>${project.version}</version>
-                    <scope>compile</scope>
-                </dependency>
-            </dependencies>
-            <properties>
-                <skipSIMD>false</skipSIMD>
-            </properties>
-        </profile>
-        <profile>
-            <id>jdk11</id>
-            <properties>
-                <skipScalar>false</skipScalar>
-            </properties>
-        </profile>
     </profiles>
 </project>

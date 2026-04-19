@@ -147,8 +147,7 @@ final public class MemorySegmentVectorFloat implements VectorFloat<MemorySegment
     @Override
     public void copyFrom(VectorFloat<?> src, int srcOffset, int destOffset, int length)
     {
-        if (src instanceof MemorySegmentVectorFloat) {
-            MemorySegmentVectorFloat csrc = (MemorySegmentVectorFloat) src;
+        if (src instanceof MemorySegmentVectorFloat csrc) {
             segment.asSlice((long) destOffset * Float.BYTES, (long) length * Float.BYTES)
                     .copyFrom(csrc.segment.asSlice((long) srcOffset * Float.BYTES, (long) length * Float.BYTES));
             return;

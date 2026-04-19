@@ -57,10 +57,7 @@ public class ByteBufferRandomAccessVectorValues implements RandomAccessVectorVal
             throw new IllegalArgumentException(
                     "buffer too small: need " + need + " bytes, have " + data.remaining());
         }
-        ByteBuffer dup = data.duplicate().order(data.order());
-        int startByte = data.position();
-        dup.position(startByte).limit(startByte + (int) need);
-        this.data = dup.slice().order(data.order());
+        this.data = data.slice(data.position(), (int) need).order(data.order());
         this.count = count;
         this.dimension = dimension;
     }

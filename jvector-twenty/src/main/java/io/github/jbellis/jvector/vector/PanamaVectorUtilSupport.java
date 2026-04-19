@@ -27,6 +27,7 @@ import jdk.incubator.vector.VectorMask;
 import jdk.incubator.vector.VectorOperators;
 import jdk.incubator.vector.VectorSpecies;
 
+import java.lang.foreign.MemorySegment;
 import java.util.List;
 
 class PanamaVectorUtilSupport implements VectorUtilSupport {
@@ -43,24 +44,22 @@ class PanamaVectorUtilSupport implements VectorUtilSupport {
     static final ThreadLocal<int[]> scratchInt256 = ThreadLocal.withInitial(() -> new int[IntVector.SPECIES_256.length()]);
 
     protected FloatVector fromVectorFloat(VectorSpecies<Float> SPEC, VectorFloat<?> vector, int offset) {
-        if (vector instanceof BufferVectorFloat) {
-            // jvector-twenty targets Java 20 where java.lang.foreign.MemorySegment is still
-            // preview, so we can't use FloatVector.fromMemorySegment here (that path lives in
-            // jvector-native, which targets Java 22 and has stable MemorySegment). Scalar-fill a
-            // SPEC-sized scratch instead. The scratch is ≤ 16 floats and typically elided by
-            // escape analysis in the hot loop. Full SIMD on BufferVectorFloat requires the
-            // native module.
-            float[] scratch = new float[SPEC.length()];
-            for (int i = 0; i < SPEC.length(); i++) {
-                scratch[i] = vector.get(offset + i);
-            }
-            return FloatVector.fromArray(SPEC, scratch, 0);
+        if (vector instanceof BufferVectorFloat bv) {
+            // bv.get() is an independent slice whose position 0 corresponds to element 0,
+            // so the byte offset into the segment is simply offset * Float.BYTES.
+            return FloatVector.fromMemorySegment(
+                    SPEC,
+                    MemorySegment.ofBuffer(bv.get()),
+                    (long) offset * Float.BYTES,
+                    bv.byteOrder());
         }
         return FloatVector.fromArray(SPEC, ((ArrayVectorFloat) vector).get(), offset);
     }
 
     protected FloatVector fromVectorFloat(VectorSpecies<Float> SPEC, VectorFloat<?> vector, int offset, int[] indices, int indicesOffset) {
         if (vector instanceof BufferVectorFloat) {
+            // FloatVector has no gather-from-MemorySegment variant; fall back to a short scalar gather.
+            // The scratch array is at most SPEC.length() floats (≤16), allocated per call.
             float[] scratch = new float[SPEC.length()];
             for (int i = 0; i < SPEC.length(); i++) {
                 scratch[i] = vector.get(offset + indices[indicesOffset + i]);
@@ -71,13 +70,11 @@ class PanamaVectorUtilSupport implements VectorUtilSupport {
     }
 
     protected void intoVectorFloat(FloatVector vector, VectorFloat<?> v, int offset) {
-        if (v instanceof BufferVectorFloat) {
-            int len = vector.species().length();
-            float[] scratch = new float[len];
-            vector.intoArray(scratch, 0);
-            for (int i = 0; i < len; i++) {
-                v.set(offset + i, scratch[i]);
-            }
+        if (v instanceof BufferVectorFloat bv) {
+            vector.intoMemorySegment(
+                    MemorySegment.ofBuffer(bv.get()),
+                    (long) offset * Float.BYTES,
+                    bv.byteOrder());
             return;
         }
         vector.intoArray(((ArrayVectorFloat) v).get(), offset);

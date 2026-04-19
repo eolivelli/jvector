@@ -58,10 +58,9 @@ public class MemorySegmentVectorProvider implements VectorTypeSupport
         if (data.order() != java.nio.ByteOrder.LITTLE_ENDIAN) {
             return VectorTypeSupport.super.wrapFloatVector(data, floatOffset, floatLength);
         }
-        ByteBuffer dup = data.duplicate().order(data.order());
         int startByte = data.position() + floatOffset * Float.BYTES;
-        dup.position(startByte).limit(startByte + floatLength * Float.BYTES);
-        return MemorySegmentVectorFloat.wrap(dup);
+        ByteBuffer slice = data.slice(startByte, floatLength * Float.BYTES).order(data.order());
+        return MemorySegmentVectorFloat.wrap(slice);
     }
 
     @Override

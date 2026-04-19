@@ -104,11 +104,8 @@ public final class BufferVectorFloat implements VectorFloat<ByteBuffer>
                     "view [" + floatOffset + "," + (floatOffset + floatLength)
                     + ") floats exceeds buffer remaining=" + data.remaining() + " bytes");
         }
-        ByteBuffer dup = data.duplicate().order(data.order());
         int startByte = data.position() + floatOffset * Float.BYTES;
-        int endByte = startByte + floatLength * Float.BYTES;
-        dup.position(startByte).limit(endByte);
-        this.data = dup.slice().order(data.order());
+        this.data = data.slice(startByte, floatLength * Float.BYTES).order(data.order());
         this.byteOffset = 0;
         this.floatLength = floatLength;
     }
@@ -173,32 +170,27 @@ public final class BufferVectorFloat implements VectorFloat<ByteBuffer>
     public VectorFloat<ByteBuffer> copy()
     {
         ByteBuffer owned = ByteBuffer.allocate(floatLength * Float.BYTES).order(data.order());
-        ByteBuffer srcView = data.duplicate().order(data.order());
-        srcView.position(byteOffset).limit(byteOffset + floatLength * Float.BYTES);
-        owned.put(srcView);
-        owned.rewind();
+        ByteBuffer srcSlice = data.slice(byteOffset, floatLength * Float.BYTES).order(data.order());
+        owned.put(srcSlice).rewind();
         return new BufferVectorFloat(owned, 0, floatLength);
     }
 
     @Override
     public void copyFrom(VectorFloat<?> src, int srcOffset, int destOffset, int length)
     {
-        if (src instanceof BufferVectorFloat) {
-            BufferVectorFloat bsrc = (BufferVectorFloat) src;
-            if (bsrc.byteOrder() == this.byteOrder()) {
-                ByteBuffer srcDup = bsrc.data.duplicate().order(bsrc.data.order());
-                int srcStart = bsrc.byteOffset + srcOffset * Float.BYTES;
-                int bytes = length * Float.BYTES;
-                srcDup.position(srcStart).limit(srcStart + bytes);
-                ByteBuffer destDup = this.data.duplicate().order(this.data.order());
-                destDup.position(this.byteOffset + destOffset * Float.BYTES);
-                destDup.put(srcDup);
-                return;
-            }
-        } else if (src instanceof ArrayVectorFloat) {
-            float[] a = ((ArrayVectorFloat) src).get();
+        if (src instanceof BufferVectorFloat bsrc && bsrc.byteOrder() == this.byteOrder()) {
+            int srcStart = bsrc.byteOffset + srcOffset * Float.BYTES;
+            int bytes = length * Float.BYTES;
+            ByteBuffer srcSlice = bsrc.data.slice(srcStart, bytes).order(bsrc.data.order());
+            ByteBuffer destDup = this.data.duplicate().order(this.data.order());
+            destDup.position(this.byteOffset + destOffset * Float.BYTES);
+            destDup.put(srcSlice);
+            return;
+        }
+        if (src instanceof ArrayVectorFloat a) {
+            float[] raw = a.get();
             for (int i = 0; i < length; i++) {
-                set(destOffset + i, a[srcOffset + i]);
+                set(destOffset + i, raw[srcOffset + i]);
             }
             return;
         }
