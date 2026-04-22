@@ -33,12 +33,15 @@ import io.github.jbellis.jvector.util.Bits;
 import io.github.jbellis.jvector.util.BoundedLongHeap;
 import io.github.jbellis.jvector.util.GrowableLongHeap;
 import io.github.jbellis.jvector.vector.VectorSimilarityFunction;
+import io.github.jbellis.jvector.vector.VectorizationProvider;
 import io.github.jbellis.jvector.vector.types.VectorFloat;
+import io.github.jbellis.jvector.vector.types.VectorTypeSupport;
 import org.agrona.collections.Int2ObjectHashMap;
 import org.agrona.collections.IntHashSet;
 
 import java.io.Closeable;
 import java.io.IOException;
+import java.nio.ByteBuffer;
 
 
 /**
@@ -149,6 +152,26 @@ public class GraphSearcher implements Closeable {
         } catch (Exception e) {
             throw new RuntimeException(e);
         }
+    }
+
+    /**
+     * Zero-copy ByteBuffer overload of {@link #search(VectorFloat, int, RandomAccessVectorValues,
+     * VectorSimilarityFunction, ImmutableGraphIndex, Bits)}. The buffer is interpreted as
+     * {@code Float.BYTES}-aligned IEEE 754 floats in its current {@link java.nio.ByteOrder};
+     * no {@code float[]} materialization occurs.
+     */
+    public static SearchResult search(ByteBuffer queryVector, int topK, RandomAccessVectorValues vectors, VectorSimilarityFunction similarityFunction, ImmutableGraphIndex graph, Bits acceptOrds) {
+        VectorTypeSupport vts = VectorizationProvider.getInstance().getVectorTypeSupport();
+        return search(vts.wrapFloatVector(queryVector), topK, vectors, similarityFunction, graph, acceptOrds);
+    }
+
+    /**
+     * Zero-copy ByteBuffer overload with explicit rerankK. See
+     * {@link #search(ByteBuffer, int, RandomAccessVectorValues, VectorSimilarityFunction, ImmutableGraphIndex, Bits)}.
+     */
+    public static SearchResult search(ByteBuffer queryVector, int topK, int rerankK, RandomAccessVectorValues vectors, VectorSimilarityFunction similarityFunction, ImmutableGraphIndex graph, Bits acceptOrds) {
+        VectorTypeSupport vts = VectorizationProvider.getInstance().getVectorTypeSupport();
+        return search(vts.wrapFloatVector(queryVector), topK, rerankK, vectors, similarityFunction, graph, acceptOrds);
     }
 
     /**

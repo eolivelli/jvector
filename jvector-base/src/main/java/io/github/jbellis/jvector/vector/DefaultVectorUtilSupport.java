@@ -37,6 +37,15 @@ final class DefaultVectorUtilSupport implements VectorUtilSupport {
 
   @Override
   public float dotProduct(VectorFloat<?> av, VectorFloat<?> bv) {
+    if (!(av instanceof ArrayVectorFloat) || !(bv instanceof ArrayVectorFloat)) {
+      // generic path: any VectorFloat impl (BufferVectorFloat, MemorySegmentVectorFloat, ...)
+      float res = 0f;
+      int len = av.length();
+      for (int i = 0; i < len; i++) {
+        res += av.get(i) * bv.get(i);
+      }
+      return res;
+    }
     float[] a = ((ArrayVectorFloat) av).get();
     float[] b = ((ArrayVectorFloat) bv).get();
 
@@ -107,6 +116,13 @@ final class DefaultVectorUtilSupport implements VectorUtilSupport {
   @Override
   public float dotProduct(VectorFloat<?> av, int aoffset, VectorFloat<?> bv, int boffset, int length)
   {
+    if (!(av instanceof ArrayVectorFloat) || !(bv instanceof ArrayVectorFloat)) {
+      float sum = 0f;
+      for (int i = 0; i < length; i++) {
+        sum += av.get(aoffset + i) * bv.get(boffset + i);
+      }
+      return sum;
+    }
     float[] b = ((ArrayVectorFloat) bv).get();
     float[] a = ((ArrayVectorFloat) av).get();
 
@@ -120,6 +136,17 @@ final class DefaultVectorUtilSupport implements VectorUtilSupport {
 
   @Override
   public float cosine(VectorFloat<?> av, VectorFloat<?> bv) {
+    if (!(av instanceof ArrayVectorFloat) || !(bv instanceof ArrayVectorFloat)) {
+      float sum = 0.0f, norm1 = 0.0f, norm2 = 0.0f;
+      int dim = av.length();
+      for (int i = 0; i < dim; i++) {
+        float e1 = av.get(i), e2 = bv.get(i);
+        sum += e1 * e2;
+        norm1 += e1 * e1;
+        norm2 += e2 * e2;
+      }
+      return (float) (sum / Math.sqrt(norm1 * norm2));
+    }
     float[] a = ((ArrayVectorFloat) av).get();
     float[] b = ((ArrayVectorFloat) bv).get();
 
@@ -140,6 +167,16 @@ final class DefaultVectorUtilSupport implements VectorUtilSupport {
 
   @Override
   public float cosine(VectorFloat<?> av, int aoffset, VectorFloat<?> bv, int boffset, int length) {
+    if (!(av instanceof ArrayVectorFloat) || !(bv instanceof ArrayVectorFloat)) {
+      float sum = 0.0f, norm1 = 0.0f, norm2 = 0.0f;
+      for (int i = 0; i < length; i++) {
+        float e1 = av.get(aoffset + i), e2 = bv.get(boffset + i);
+        sum += e1 * e2;
+        norm1 += e1 * e1;
+        norm2 += e2 * e2;
+      }
+      return (float) (sum / Math.sqrt(norm1 * norm2));
+    }
     float[] a = ((ArrayVectorFloat) av).get();
     float[] b = ((ArrayVectorFloat) bv).get();
     float sum = 0.0f;
@@ -157,6 +194,15 @@ final class DefaultVectorUtilSupport implements VectorUtilSupport {
 
   @Override
   public float squareDistance(VectorFloat<?> av, VectorFloat<?> bv) {
+    if (!(av instanceof ArrayVectorFloat) || !(bv instanceof ArrayVectorFloat)) {
+      float squareSum = 0.0f;
+      int dim = av.length();
+      for (int i = 0; i < dim; i++) {
+        float diff = av.get(i) - bv.get(i);
+        squareSum += diff * diff;
+      }
+      return squareSum;
+    }
     float[] a = ((ArrayVectorFloat) av).get();
     float[] b = ((ArrayVectorFloat) bv).get();
 
@@ -195,6 +241,14 @@ final class DefaultVectorUtilSupport implements VectorUtilSupport {
   @Override
   public float squareDistance(VectorFloat<?> av, int aoffset, VectorFloat<?> bv, int boffset, int length)
   {
+    if (!(av instanceof ArrayVectorFloat) || !(bv instanceof ArrayVectorFloat)) {
+      float squareSum = 0f;
+      for (int i = 0; i < length; i++) {
+        float diff = av.get(aoffset + i) - bv.get(boffset + i);
+        squareSum += diff * diff;
+      }
+      return squareSum;
+    }
     float[] a = ((ArrayVectorFloat) av).get();
     float[] b = ((ArrayVectorFloat) bv).get();
 

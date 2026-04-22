@@ -38,32 +38,53 @@ final class NativeVectorUtilSupport extends PanamaVectorUtilSupport
 
     @Override
     protected FloatVector fromVectorFloat(VectorSpecies<Float> SPEC, VectorFloat<?> vector, int offset) {
-        return FloatVector.fromMemorySegment(SPEC, ((MemorySegmentVectorFloat) vector).get(), vector.offset(offset), ByteOrder.LITTLE_ENDIAN);
+        if (vector instanceof MemorySegmentVectorFloat msv) {
+            return FloatVector.fromMemorySegment(SPEC, msv.get(), vector.offset(offset), ByteOrder.LITTLE_ENDIAN);
+        }
+        return super.fromVectorFloat(SPEC, vector, offset);
     }
 
     @Override
     protected FloatVector fromVectorFloat(VectorSpecies<Float> SPEC, VectorFloat<?> vector, int offset, int[] indices, int indicesOffset) {
-        throw new UnsupportedOperationException("Assembly not supported with memory segments.");
+        if (vector instanceof MemorySegmentVectorFloat) {
+            throw new UnsupportedOperationException("Assembly not supported with memory segments.");
+        }
+        return super.fromVectorFloat(SPEC, vector, offset, indices, indicesOffset);
     }
 
     @Override
     protected void intoVectorFloat(FloatVector vector, VectorFloat<?> v, int offset) {
-        vector.intoMemorySegment(((MemorySegmentVectorFloat) v).get(), v.offset(offset), ByteOrder.LITTLE_ENDIAN);
+        if (v instanceof MemorySegmentVectorFloat msv) {
+            vector.intoMemorySegment(msv.get(), v.offset(offset), ByteOrder.LITTLE_ENDIAN);
+            return;
+        }
+        super.intoVectorFloat(vector, v, offset);
     }
 
     @Override
     protected ByteVector fromByteSequence(VectorSpecies<Byte> SPEC, ByteSequence<?> vector, int offset) {
-        return ByteVector.fromMemorySegment(SPEC, ((MemorySegmentByteSequence) vector).get(), offset, ByteOrder.LITTLE_ENDIAN);
+        if (vector instanceof MemorySegmentByteSequence msb) {
+            return ByteVector.fromMemorySegment(SPEC, msb.get(), offset, ByteOrder.LITTLE_ENDIAN);
+        }
+        return super.fromByteSequence(SPEC, vector, offset);
     }
 
     @Override
     protected void intoByteSequence(ByteVector vector, ByteSequence<?> v, int offset) {
-        vector.intoMemorySegment(((MemorySegmentByteSequence) v).get(), offset, ByteOrder.LITTLE_ENDIAN);
+        if (v instanceof MemorySegmentByteSequence msb) {
+            vector.intoMemorySegment(msb.get(), offset, ByteOrder.LITTLE_ENDIAN);
+            return;
+        }
+        super.intoByteSequence(vector, v, offset);
     }
 
     @Override
     protected void intoByteSequence(ByteVector vector, ByteSequence<?> v, int offset, VectorMask<Byte> mask) {
-        vector.intoMemorySegment(((MemorySegmentByteSequence) v).get(), offset, ByteOrder.LITTLE_ENDIAN, mask);
+        if (v instanceof MemorySegmentByteSequence msb) {
+            vector.intoMemorySegment(msb.get(), offset, ByteOrder.LITTLE_ENDIAN, mask);
+            return;
+        }
+        super.intoByteSequence(vector, v, offset, mask);
     }
 
     @Override

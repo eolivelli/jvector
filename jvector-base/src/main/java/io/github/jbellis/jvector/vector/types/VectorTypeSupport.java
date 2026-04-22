@@ -18,15 +18,27 @@ package io.github.jbellis.jvector.vector.types;
 
 import io.github.jbellis.jvector.disk.IndexWriter;
 import io.github.jbellis.jvector.disk.RandomAccessReader;
+import io.github.jbellis.jvector.vector.BufferVectorFloat;
 
 import java.io.IOException;
+import java.nio.ByteBuffer;
 
 public interface VectorTypeSupport {
     /**
      * Create a vector from the given data.
      *
-     * @param data the data to create the vector from. Supported data types are implementation-dependent.
+     * @param data the data to create the vector from. Supported data types are implementation-dependent
+     *             (typically {@code float[]}; some providers also accept {@link java.nio.Buffer}).
+     *             This method <em>takes ownership</em> of the data: for array inputs, most providers
+     *             wrap the array without copying, so later mutation of the caller's array is visible.
+     *             For {@code Buffer} inputs the behavior is provider-specific (some copy, some wrap).
      * @return the created vector.
+     *
+     * <p><b>Prefer the typed factories</b> when possible:
+     * {@link #wrapFloatVector(ByteBuffer)} gives a zero-copy borrow from a ByteBuffer, and
+     * {@link #createFloatVector(int)} returns an owned, zero-filled allocation. The
+     * {@code Object} parameter here is unsafe — a wrong runtime type triggers a
+     * {@code ClassCastException} inside the provider.
      */
     VectorFloat<?> createFloatVector(Object data);
 
@@ -36,6 +48,38 @@ public interface VectorTypeSupport {
      * @return the created vector.
      */
     VectorFloat<?> createFloatVector(int length);
+
+    /**
+     * Wrap a caller-owned {@link ByteBuffer} as a float vector view without copying. The buffer
+     * is treated as a contiguous sequence of IEEE 754 floats laid out in its current
+     * {@link java.nio.ByteOrder}; the buffer's position acts as the starting byte offset.
+     *
+     * <p>Semantically this is the zero-copy counterpart to {@link #createFloatVector(Object)}:
+     * {@code create} takes ownership of storage (copying if necessary); {@code wrap} borrows it.
+     *
+     * <p>Callers must not deallocate / re-purpose the backing buffer while the returned view is
+     * in use. Mutating the buffer's position and limit after construction does not disturb the
+     * view; mutating the buffer's content does.
+     */
+    default VectorFloat<?> wrapFloatVector(ByteBuffer data) {
+        if ((data.remaining() % Float.BYTES) != 0) {
+            throw new IllegalArgumentException(
+                    "ByteBuffer remaining() must be a multiple of Float.BYTES, was " + data.remaining());
+        }
+        return wrapFloatVector(data, 0, data.remaining() / Float.BYTES);
+    }
+
+    /**
+     * Wrap a sub-range of a caller-owned {@link ByteBuffer} as a float vector view without
+     * copying. See {@link #wrapFloatVector(ByteBuffer)} for the copy contract.
+     *
+     * @param data         backing buffer
+     * @param floatOffset  starting offset in floats, relative to the buffer's current position
+     * @param floatLength  number of floats in the resulting view
+     */
+    default VectorFloat<?> wrapFloatVector(ByteBuffer data, int floatOffset, int floatLength) {
+        return new BufferVectorFloat(data, floatOffset, floatLength);
+    }
 
     /**
      * Read a vector from the given RandomAccessReader.

@@ -30,13 +30,16 @@ import io.github.jbellis.jvector.util.ExceptionUtils;
 import io.github.jbellis.jvector.util.ExplicitThreadLocal;
 import io.github.jbellis.jvector.util.PhysicalCoreExecutor;
 import io.github.jbellis.jvector.vector.VectorSimilarityFunction;
+import io.github.jbellis.jvector.vector.VectorizationProvider;
 import io.github.jbellis.jvector.vector.types.VectorFloat;
+import io.github.jbellis.jvector.vector.types.VectorTypeSupport;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.Closeable;
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.nio.ByteBuffer;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentSkipListSet;
@@ -591,6 +594,17 @@ public class GraphIndexBuilder implements Closeable {
     public long addGraphNode(int node, VectorFloat<?> vector) {
         var ssp = scoreProvider.searchProviderFor(vector);
         return addGraphNode(node, ssp);
+    }
+
+    /**
+     * Zero-copy ByteBuffer overload of {@link #addGraphNode(int, VectorFloat)}. The buffer is
+     * interpreted as contiguous IEEE 754 floats in its current {@link java.nio.ByteOrder}, so
+     * callers that already hold vector data as ByteBuffer (for example a database page cache)
+     * can feed the builder without the usual {@code float[]} materialization step.
+     */
+    public long addGraphNode(int node, ByteBuffer vector) {
+        VectorTypeSupport vts = VectorizationProvider.getInstance().getVectorTypeSupport();
+        return addGraphNode(node, vts.wrapFloatVector(vector));
     }
 
     /**

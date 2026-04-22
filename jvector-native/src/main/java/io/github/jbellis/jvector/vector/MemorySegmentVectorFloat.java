@@ -22,6 +22,7 @@ import io.github.jbellis.jvector.vector.types.VectorFloat;
 
 import java.io.IOException;
 import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
 import java.nio.Buffer;
 
 /**
@@ -35,6 +36,11 @@ final public class MemorySegmentVectorFloat implements VectorFloat<MemorySegment
         segment = MemorySegment.ofArray(new float[length]);
     }
 
+    /**
+     * @deprecated This constructor <em>copies</em> the buffer contents. To share storage without
+     * copying, use {@link #wrap(java.nio.ByteBuffer)} instead.
+     */
+    @Deprecated
     MemorySegmentVectorFloat(Buffer buffer) {
         this(buffer.remaining());
         segment.copyFrom(MemorySegment.ofBuffer(buffer));
@@ -42,6 +48,31 @@ final public class MemorySegmentVectorFloat implements VectorFloat<MemorySegment
 
     MemorySegmentVectorFloat(float[] data) {
         this.segment = MemorySegment.ofArray(data);
+    }
+
+    private MemorySegmentVectorFloat(MemorySegment segment) {
+        this.segment = segment;
+    }
+
+    /**
+     * Create a view of the given {@link java.nio.ByteBuffer} as a MemorySegment-backed vector
+     * without copying. The buffer's bytes are interpreted as native-layout IEEE 754 floats in
+     * the buffer's current {@link java.nio.ByteOrder} (jvector's SIMD paths use little-endian).
+     *
+     * <p>In contrast to {@link #MemorySegmentVectorFloat(Buffer)} which eagerly copies into a
+     * fresh segment, this factory wraps the buffer's storage in place via
+     * {@link MemorySegment#ofBuffer(java.nio.Buffer)}.
+     */
+    public static MemorySegmentVectorFloat wrap(java.nio.ByteBuffer buffer) {
+        if ((buffer.remaining() % Float.BYTES) != 0) {
+            throw new IllegalArgumentException(
+                    "ByteBuffer remaining() must be a multiple of Float.BYTES, was " + buffer.remaining());
+        }
+        if (buffer.order() != java.nio.ByteOrder.LITTLE_ENDIAN) {
+            throw new IllegalArgumentException(
+                    "Native SIMD path requires ByteOrder.LITTLE_ENDIAN, got " + buffer.order());
+        }
+        return new MemorySegmentVectorFloat(MemorySegment.ofBuffer(buffer));
     }
 
     @Override
@@ -61,15 +92,25 @@ final public class MemorySegmentVectorFloat implements VectorFloat<MemorySegment
     @Override
     public float get(int n)
     {
-        // this is (unfortunately) meaningfully better performing than getting at an offset in the memory segment
-        return ((float[])segment.heapBase().get())[n];
+        // Fast path for on-heap segments: direct float[] indexing is meaningfully faster than
+        // the generic MemorySegment accessors. Fall back to segment access for off-heap buffers
+        // (e.g., native memory, direct ByteBuffers) where heapBase() is empty.
+        var heap = segment.heapBase();
+        if (heap.isPresent()) {
+            return ((float[]) heap.get())[n];
+        }
+        return segment.getAtIndex(ValueLayout.JAVA_FLOAT, n);
     }
 
     @Override
     public void set(int n, float value)
     {
-        // this is (unfortunately) meaningfully better performing than setting at an offset in the memory segment
-        ((float[])segment.heapBase().get())[n] = value;
+        var heap = segment.heapBase();
+        if (heap.isPresent()) {
+            ((float[]) heap.get())[n] = value;
+            return;
+        }
+        segment.setAtIndex(ValueLayout.JAVA_FLOAT, n, value);
     }
 
     @Override
@@ -104,11 +145,33 @@ final public class MemorySegmentVectorFloat implements VectorFloat<MemorySegment
     }
 
     @Override
+    public VectorFloat<?> subview(int floatOffset, int floatLength)
+    {
+        int len = length();
+        if (floatOffset < 0 || floatLength < 0 || (long) floatOffset + floatLength > len) {
+            throw new IllegalArgumentException(
+                    "subview [" + floatOffset + "," + (floatOffset + floatLength)
+                            + ") out of range for length " + len);
+        }
+        if (floatOffset == 0 && floatLength == len) {
+            return this;
+        }
+        return new MemorySegmentVectorFloat(
+                segment.asSlice((long) floatOffset * Float.BYTES, (long) floatLength * Float.BYTES));
+    }
+
+    @Override
     public void copyFrom(VectorFloat<?> src, int srcOffset, int destOffset, int length)
     {
-        MemorySegmentVectorFloat csrc = (MemorySegmentVectorFloat) src;
-        segment.asSlice((long) destOffset * Float.BYTES, (long) length * Float.BYTES)
-                .copyFrom(csrc.segment.asSlice((long) srcOffset * Float.BYTES, (long) length * Float.BYTES));
+        if (src instanceof MemorySegmentVectorFloat csrc) {
+            segment.asSlice((long) destOffset * Float.BYTES, (long) length * Float.BYTES)
+                    .copyFrom(csrc.segment.asSlice((long) srcOffset * Float.BYTES, (long) length * Float.BYTES));
+            return;
+        }
+        // generic fallback for ArrayVectorFloat, BufferVectorFloat, or any other VectorFloat impl
+        for (int i = 0; i < length; i++) {
+            set(destOffset + i, src.get(srcOffset + i));
+        }
     }
 
     @Override

@@ -79,10 +79,28 @@ final public class ArrayVectorFloat implements VectorFloat<float[]>
     }
 
     @Override
+    public VectorFloat<?> subview(int floatOffset, int floatLength)
+    {
+        if (floatOffset == 0 && floatLength == data.length) {
+            return this;
+        }
+        return new ArraySliceVectorFloat(data, floatOffset, floatLength);
+    }
+
+    @Override
     public void copyFrom(VectorFloat<?> src, int srcOffset, int destOffset, int length)
     {
-        ArrayVectorFloat csrc = (ArrayVectorFloat) src;
-        System.arraycopy(csrc.data, srcOffset, data, destOffset, length);
+        if (src instanceof ArrayVectorFloat csrc) {
+            System.arraycopy(csrc.data, srcOffset, data, destOffset, length);
+            return;
+        }
+        if (src instanceof ArraySliceVectorFloat ssrc) {
+            System.arraycopy(ssrc.get(), ssrc.arrayOffset() + srcOffset, data, destOffset, length);
+            return;
+        }
+        for (int i = 0; i < length; i++) {
+            data[destOffset + i] = src.get(srcOffset + i);
+        }
     }
 
     @Override

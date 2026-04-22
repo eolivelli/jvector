@@ -517,12 +517,14 @@ public class ProductQuantization implements VectorCompressor<ByteSequence<?>>, A
     }
 
     /**
-     * Extracts the m-th subvector from a single vector.
+     * Extracts the m-th subvector from a single vector. Returns a zero-copy view via
+     * {@link VectorFloat#subview(int, int)} — no {@code float[]} allocation per subvector,
+     * which matters at codebook training time where this is called once per
+     * {@code (training_vector × subspace)} and would otherwise produce
+     * {@code N × M} small heap allocations.
      */
     static VectorFloat<?> getSubVector(VectorFloat<?> vector, int m, int[][] subvectorSizeAndOffset) {
-        VectorFloat<?> subvector = vectorTypeSupport.createFloatVector(subvectorSizeAndOffset[m][0]);
-        subvector.copyFrom(vector, subvectorSizeAndOffset[m][1], 0, subvectorSizeAndOffset[m][0]);
-        return subvector;
+        return vector.subview(subvectorSizeAndOffset[m][1], subvectorSizeAndOffset[m][0]);
     }
 
     /**
