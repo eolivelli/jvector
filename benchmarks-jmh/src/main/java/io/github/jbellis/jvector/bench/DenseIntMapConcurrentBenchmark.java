@@ -10,6 +10,7 @@
 package io.github.jbellis.jvector.bench;
 
 import io.github.jbellis.jvector.util.DenseIntMap;
+import io.github.jbellis.jvector.util.IntMap;
 import org.openjdk.jmh.annotations.Benchmark;
 import org.openjdk.jmh.annotations.BenchmarkMode;
 import org.openjdk.jmh.annotations.Fork;
@@ -29,6 +30,7 @@ import org.openjdk.jmh.infra.Blackhole;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.IntFunction;
 
 /**
  * Measures the throughput of concurrent {@link DenseIntMap} operations — the map that sits on
@@ -37,10 +39,13 @@ import java.util.concurrent.atomic.AtomicInteger;
  * <p>
  * Parameters:
  * <ul>
+ *   <li>{@code impl} — {@code legacy} (previous RW-lock + single {@code AtomicReferenceArray})
+ *       vs {@code segmented} (current lock-free spine-of-segments). Both implementations run
+ *       in the same JVM under identical conditions so results are directly comparable.</li>
  *   <li>{@code initialCapacity} — {@code 1024} (default) vs. {@code totalKeys} (pre-sized hint).
- *       The hinted case should show near-zero overhead from internal segment allocation.</li>
- *   <li>{@code totalKeys} — size of the working set. Larger sizes amplify any allocation or
- *       contention overhead.</li>
+ *       The hinted case isolates the "no resize required" scenario that best-case deployments
+ *       (known shard size) can hit.</li>
+ *   <li>{@code totalKeys} — size of the working set.</li>
  * </ul>
  * Thread counts are expressed via {@code @Threads} on each benchmark method: 1 and 8.
  */
@@ -52,6 +57,20 @@ import java.util.concurrent.atomic.AtomicInteger;
 @State(Scope.Benchmark)
 public class DenseIntMapConcurrentBenchmark {
 
+    public enum Impl {
+        legacy(LegacyDenseIntMap::new),
+        segmented(DenseIntMap::new);
+
+        final IntFunction<IntMap<Integer>> factory;
+
+        Impl(IntFunction<IntMap<Integer>> factory) {
+            this.factory = factory;
+        }
+    }
+
+    @Param
+    public Impl impl;
+
     @Param({"1024", "1000000"})
     public int initialCapacity;
 
@@ -59,38 +78,48 @@ public class DenseIntMapConcurrentBenchmark {
     public int totalKeys;
 
     /** Shared map used by the "mixed" (pre-populated) benchmarks. */
-    private DenseIntMap<Integer> prepopulated;
+    private IntMap<Integer> prepopulated;
 
     /** Monotonic counter used by insert benchmarks so threads never collide on keys. */
     private final AtomicInteger insertCursor = new AtomicInteger();
 
     /** The map written to by insert benchmarks. Replaced in each trial's setup. */
-    private DenseIntMap<Integer> insertMap;
+    private IntMap<Integer> insertMap;
 
     @Setup
     public void setup() {
-        this.prepopulated = new DenseIntMap<>(initialCapacity);
+        this.prepopulated = impl.factory.apply(initialCapacity);
         for (int i = 0; i < totalKeys; i++) {
             prepopulated.compareAndPut(i, null, i);
         }
-        this.insertMap = new DenseIntMap<>(initialCapacity);
+        this.insertMap = impl.factory.apply(initialCapacity);
         this.insertCursor.set(0);
     }
 
     /**
      * Models the {@code addNode} insertion pressure during graph build: many threads inserting
-     * disjoint dense keys. Under the old RW-lock design this path contended on the read lock
-     * whenever any writer happened to be resizing the array.
+     * disjoint dense keys. Under the legacy design this path contended on the read lock whenever
+     * any writer happened to be resizing the backing array.
      */
     @Benchmark
     @Threads(8)
     public boolean insertDense8(Blackhole bh) {
+        return doInsert(bh);
+    }
+
+    @Benchmark
+    @Threads(1)
+    public boolean insertDense1(Blackhole bh) {
+        return doInsert(bh);
+    }
+
+    private boolean doInsert(Blackhole bh) {
         int key = insertCursor.getAndIncrement();
         if (key >= totalKeys) {
             // Bounded workload; replace the map once we've filled it to avoid unbounded memory growth.
             synchronized (this) {
                 if (insertCursor.get() >= totalKeys) {
-                    insertMap = new DenseIntMap<>(initialCapacity);
+                    insertMap = impl.factory.apply(initialCapacity);
                     insertCursor.set(0);
                 }
             }
@@ -101,12 +130,6 @@ public class DenseIntMapConcurrentBenchmark {
         return ok;
     }
 
-    @Benchmark
-    @Threads(1)
-    public boolean insertDense1(Blackhole bh) {
-        return insertDense8(bh);
-    }
-
     /**
      * Models the steady-state {@code insertEdge}/{@code insertDiverse} CAS-update pattern on an
      * already-built base layer: each thread reads then CAS-updates a random pre-populated key.
@@ -114,17 +137,21 @@ public class DenseIntMapConcurrentBenchmark {
     @Benchmark
     @Threads(8)
     public boolean casUpdate8(Blackhole bh) {
-        int key = ThreadLocalRandom.current().nextInt(totalKeys);
-        Integer current = prepopulated.get(key);
-        boolean ok = prepopulated.compareAndPut(key, current, key + 1);
-        bh.consume(ok);
-        return ok;
+        return doCasUpdate(bh);
     }
 
     @Benchmark
     @Threads(1)
     public boolean casUpdate1(Blackhole bh) {
-        return casUpdate8(bh);
+        return doCasUpdate(bh);
+    }
+
+    private boolean doCasUpdate(Blackhole bh) {
+        int key = ThreadLocalRandom.current().nextInt(totalKeys);
+        Integer current = prepopulated.get(key);
+        boolean ok = prepopulated.compareAndPut(key, current, key + 1);
+        bh.consume(ok);
+        return ok;
     }
 
     /**
@@ -142,7 +169,8 @@ public class DenseIntMapConcurrentBenchmark {
     @Benchmark
     @Threads(1)
     public Integer getHot1() {
-        return getHot8();
+        int key = ThreadLocalRandom.current().nextInt(totalKeys);
+        return prepopulated.get(key);
     }
 
     /**
