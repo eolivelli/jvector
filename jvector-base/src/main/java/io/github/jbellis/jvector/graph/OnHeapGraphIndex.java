@@ -85,15 +85,22 @@ public class OnHeapGraphIndex implements MutableGraphIndex {
     private final boolean isHierarchical;
 
     OnHeapGraphIndex(List<Integer> maxDegrees, int dimension, double overflowRatio, DiversityProvider diversityProvider, boolean isHierarchical) {
+        this(maxDegrees, dimension, overflowRatio, diversityProvider, isHierarchical, 1024);
+    }
+
+    OnHeapGraphIndex(List<Integer> maxDegrees, int dimension, double overflowRatio, DiversityProvider diversityProvider, boolean isHierarchical, int baseLayerInitialCapacity) {
+        if (baseLayerInitialCapacity <= 0) {
+            throw new IllegalArgumentException("baseLayerInitialCapacity must be positive, got " + baseLayerInitialCapacity);
+        }
         this.overflowRatio = overflowRatio;
         this.maxDegrees = new IntArrayList();
         this.dimension = dimension;
         setDegrees(maxDegrees);
         entryPoint = new AtomicReference<>();
-        this.completions = new CompletionTracker(1024);
+        this.completions = new CompletionTracker(baseLayerInitialCapacity);
         // Initialize the base layer (layer 0) with a dense map.
         this.layers.add(new ConcurrentNeighborMap(
-                new DenseIntMap<>(1024),
+                new DenseIntMap<>(baseLayerInitialCapacity),
                 diversityProvider,
                 getDegree(0),
                 (int) (getDegree(0) * overflowRatio))

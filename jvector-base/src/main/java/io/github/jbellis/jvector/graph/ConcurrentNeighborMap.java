@@ -42,7 +42,11 @@ public class ConcurrentNeighborMap {
     public final int maxOverflowDegree;
 
     public ConcurrentNeighborMap(DiversityProvider diversityProvider, int maxDegree, int maxOverflowDegree) {
-        this(new DenseIntMap<>(1024), diversityProvider, maxDegree, maxOverflowDegree);
+        this(diversityProvider, maxDegree, maxOverflowDegree, 1024);
+    }
+
+    public ConcurrentNeighborMap(DiversityProvider diversityProvider, int maxDegree, int maxOverflowDegree, int initialCapacity) {
+        this(new DenseIntMap<>(initialCapacity), diversityProvider, maxDegree, maxOverflowDegree);
     }
 
     public <T> ConcurrentNeighborMap(IntMap<Neighbors> neighbors, DiversityProvider diversityProvider, int maxDegree, int maxOverflowDegree) {

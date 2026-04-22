@@ -128,6 +128,56 @@ public class GraphIndexBuilderTest extends LuceneTestCase {
     }
 
     @Test
+    public void testInitialCapacityHintProducesEquivalentGraph() {
+        int dimension = 8;
+        int size = 200;
+        var ravv = MockVectorValues.fromValues(createRandomFloatVectors(size, dimension, getRandom()));
+        var bsp = BuildScoreProvider.randomAccessScoreProvider(ravv, VectorSimilarityFunction.COSINE);
+
+        var builderDefault = new GraphIndexBuilder(bsp, dimension, 8, 10, 1.2f, 1.0f, true, false);
+        var graphDefault = TestUtil.buildSequentially(builderDefault, ravv);
+
+        // Same build, but the caller passes an initialCapacity hint equal to the known vector count.
+        // This should produce an identical graph — the hint only changes internal sizing.
+        var builderHinted = new GraphIndexBuilder(bsp,
+                                                  dimension,
+                                                  java.util.List.of(8),
+                                                  10,
+                                                  1.2f,
+                                                  1.0f,
+                                                  true,
+                                                  false,
+                                                  java.util.concurrent.ForkJoinPool.commonPool(),
+                                                  java.util.concurrent.ForkJoinPool.commonPool(),
+                                                  size);
+        var graphHinted = TestUtil.buildSequentially(builderHinted, ravv);
+
+        assertEquals(graphDefault.size(0), graphHinted.size(0));
+        for (int i = 0; i < ravv.size(); i++) {
+            assertTrue(graphDefault.containsNode(i));
+            assertTrue(graphHinted.containsNode(i));
+        }
+    }
+
+    @Test(expected = IllegalArgumentException.class)
+    public void testInitialCapacityHintRejectsNonPositive() {
+        int dimension = 4;
+        var ravv = MockVectorValues.fromValues(createRandomFloatVectors(8, dimension, getRandom()));
+        var bsp = BuildScoreProvider.randomAccessScoreProvider(ravv, VectorSimilarityFunction.COSINE);
+        new GraphIndexBuilder(bsp,
+                              dimension,
+                              java.util.List.of(4),
+                              10,
+                              1.0f,
+                              1.0f,
+                              false,
+                              false,
+                              java.util.concurrent.ForkJoinPool.commonPool(),
+                              java.util.concurrent.ForkJoinPool.commonPool(),
+                              0);
+    }
+
+    @Test
     public void testSaveAndLoad() throws IOException {
         int dimension = randomIntBetween(2, 32);
         int size = randomIntBetween(10, 100);
