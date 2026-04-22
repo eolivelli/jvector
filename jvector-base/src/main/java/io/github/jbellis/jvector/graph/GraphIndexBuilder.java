@@ -302,6 +302,44 @@ public class GraphIndexBuilder implements Closeable {
                              ForkJoinPool simdExecutor,
                              ForkJoinPool parallelExecutor)
     {
+        this(scoreProvider, dimension, maxDegrees, beamWidth, neighborOverflow, alpha, addHierarchy, refineFinalGraph, simdExecutor, parallelExecutor, 1024);
+    }
+
+    /**
+     * Reads all the vectors from vector values, builds a graph connecting them by their dense
+     * ordinals, using the given hyperparameter settings, and returns the resulting graph.
+     *
+     * @param scoreProvider     describes how to determine the similarities between vectors
+     * @param maxDegrees        the maximum number of connections a node can have in each layer; if fewer entries
+     *                          are specified than the number of layers, the last entry is used for all remaining layers.
+     * @param beamWidth         the size of the beam search to use when finding nearest neighbors.
+     * @param neighborOverflow  the ratio of extra neighbors to allow temporarily when inserting a
+     *                          node. larger values will build more efficiently, but use more memory.
+     * @param alpha             how aggressive pruning diverse neighbors should be.  Set alpha &gt; 1.0 to
+     *                          allow longer edges.  If alpha = 1.0 then the equivalent of the lowest level of
+     *                          an HNSW graph will be created, which is usually not what you want.
+     * @param addHierarchy      whether we want to add an HNSW-style hierarchy on top of the Vamana index.
+     * @param refineFinalGraph  whether we do a second pass over each node in the graph to refine its connections
+     * @param simdExecutor      ForkJoinPool instance for SIMD operations, best is to use a pool with the size of
+     *                          the number of physical cores.
+     * @param parallelExecutor  ForkJoinPool instance for parallel stream operations
+     * @param initialCapacity   initial capacity hint for the dense base layer (layer 0). When the upper bound on
+     *                          node count is known in advance (e.g. a fixed dataset size), passing it here lets the
+     *                          base-layer map skip resizes during concurrent build, eliminating contention on the
+     *                          internal resize lock. Use {@code 1024} (the default) when the size is unknown.
+     */
+    public GraphIndexBuilder(BuildScoreProvider scoreProvider,
+                             int dimension,
+                             List<Integer> maxDegrees,
+                             int beamWidth,
+                             float neighborOverflow,
+                             float alpha,
+                             boolean addHierarchy,
+                             boolean refineFinalGraph,
+                             ForkJoinPool simdExecutor,
+                             ForkJoinPool parallelExecutor,
+                             int initialCapacity)
+    {
         if (maxDegrees.stream().anyMatch(i -> i <= 0)) {
             throw new IllegalArgumentException("layer degrees must be positive");
         }
@@ -317,6 +355,9 @@ public class GraphIndexBuilder implements Closeable {
         if (alpha <= 0) {
             throw new IllegalArgumentException("alpha must be positive");
         }
+        if (initialCapacity <= 0) {
+            throw new IllegalArgumentException("initialCapacity must be positive");
+        }
 
         this.scoreProvider = scoreProvider;
         this.dimension = dimension;
@@ -328,7 +369,7 @@ public class GraphIndexBuilder implements Closeable {
         this.simdExecutor = simdExecutor;
         this.parallelExecutor = parallelExecutor;
 
-        this.graph = new OnHeapGraphIndex(maxDegrees, dimension, neighborOverflow, new VamanaDiversityProvider(scoreProvider, alpha), addHierarchy);
+        this.graph = new OnHeapGraphIndex(maxDegrees, dimension, neighborOverflow, new VamanaDiversityProvider(scoreProvider, alpha), addHierarchy, initialCapacity);
 
         this.searchers = ExplicitThreadLocal.withInitial(() -> {
             var gs = new GraphSearcher(graph);
