@@ -16,8 +16,7 @@
 
 package io.github.jbellis.jvector.util;
 
-import io.github.jbellis.jvector.graph.NodesIterator;
-
+import java.util.function.IntConsumer;
 import java.util.stream.IntStream;
 
 public interface IntMap<T> {
@@ -49,9 +48,36 @@ public interface IntMap<T> {
     boolean containsKey(int key);
 
     /**
-     * Iterates keys in ascending order and calls the consumer for each non-null key-value pair.
+     * Iterates over each non-null key/value pair and invokes {@code consumer}.
+     * <p>
+     * Iteration order is implementation-defined; only {@link DenseIntMap} guarantees ascending
+     * keys. Iteration is weakly consistent: entries may be added or removed concurrently and the
+     * traversal will reflect the state at some point during the call.
      */
     void forEach(IntBiConsumer<T> consumer);
+
+    /**
+     * Iterates over each key currently present in the map and invokes {@code consumer} with
+     * the primitive int. Implementations should override to avoid boxing; the default delegates
+     * to {@link #forEach(IntBiConsumer)} and discards the value.
+     * <p>
+     * Iteration order and consistency follow {@link #forEach(IntBiConsumer)}.
+     */
+    default void forEachKey(IntConsumer consumer) {
+        forEach((k, v) -> consumer.accept(k));
+    }
+
+    /**
+     * Returns a primitive {@link IntStream} of every key currently present in the map.
+     * <p>
+     * The default builds the stream from {@link #forEachKey(IntConsumer)}. Specialised
+     * implementations may override for efficiency. No boxing occurs in either path.
+     */
+    default IntStream keysStream() {
+        IntStream.Builder b = IntStream.builder();
+        forEachKey(b::add);
+        return b.build();
+    }
 
     @FunctionalInterface
     interface IntBiConsumer<T2> {

@@ -28,8 +28,12 @@ import com.carrotsearch.randomizedtesting.annotations.ThreadLeakScope;
 import org.junit.Assert;
 import org.junit.Test;
 
+import java.util.HashSet;
+import java.util.Set;
+import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
+import java.util.function.Supplier;
 
 @ThreadLeakScope(ThreadLeakScope.Scope.NONE)
 public class TestIntMap extends RandomizedTest {
@@ -89,6 +93,106 @@ public class TestIntMap extends RandomizedTest {
             Assert.assertFalse(map.containsKey(i));
             Assert.assertEquals(3 - (i + 1), map.size());
         }
+    }
+
+    @Test
+    public void testForEach() {
+        for (Supplier<IntMap<String>> factory : factories()) {
+            IntMap<String> map = factory.get();
+            int[] keys = {0, 7, 99, 1024, 12345};
+            for (int k : keys) {
+                map.compareAndPut(k, null, "v" + k);
+            }
+            Set<Integer> seen = new HashSet<>();
+            map.forEach((k, v) -> {
+                Assert.assertEquals("v" + k, v);
+                Assert.assertTrue("duplicate key " + k, seen.add(k));
+            });
+            Set<Integer> expected = new HashSet<>();
+            for (int k : keys) expected.add(k);
+            Assert.assertEquals(expected, seen);
+        }
+    }
+
+    @Test
+    public void testForEachKey() {
+        for (Supplier<IntMap<String>> factory : factories()) {
+            IntMap<String> map = factory.get();
+            int[] keys = {0, 7, 99, 1024, 12345, 99999};
+            for (int k : keys) {
+                map.compareAndPut(k, null, "v" + k);
+            }
+            Set<Integer> seen = new HashSet<>();
+            map.forEachKey(k -> Assert.assertTrue("duplicate key " + k, seen.add(k)));
+            Set<Integer> expected = new HashSet<>();
+            for (int k : keys) expected.add(k);
+            Assert.assertEquals(expected, seen);
+        }
+    }
+
+    @Test
+    public void testKeysStream() {
+        for (Supplier<IntMap<String>> factory : factories()) {
+            IntMap<String> map = factory.get();
+            int[] keys = {0, 7, 99, 1024, 12345, 99999};
+            for (int k : keys) {
+                map.compareAndPut(k, null, "v" + k);
+            }
+            int[] streamed = map.keysStream().sorted().toArray();
+            int[] expected = keys.clone();
+            java.util.Arrays.sort(expected);
+            Assert.assertArrayEquals(expected, streamed);
+        }
+    }
+
+    @Test
+    public void testForEachKeyEmpty() {
+        for (Supplier<IntMap<String>> factory : factories()) {
+            IntMap<String> map = factory.get();
+            map.forEachKey(k -> Assert.fail("empty map should not visit any keys"));
+            Assert.assertEquals(0, map.keysStream().count());
+        }
+    }
+
+    @Test
+    public void testCompareAndPutContract() {
+        for (Supplier<IntMap<String>> factory : factories()) {
+            IntMap<String> map = factory.get();
+
+            // (null, v) on absent → success
+            Assert.assertTrue(map.compareAndPut(42, null, "v1"));
+            Assert.assertEquals("v1", map.get(42));
+
+            // (null, v) on present → failure
+            Assert.assertFalse(map.compareAndPut(42, null, "v2"));
+            Assert.assertEquals("v1", map.get(42));
+
+            // (mismatched, v) → failure (different reference even if equals)
+            String wrong = new String("v1");
+            Assert.assertNotSame("v1", wrong);
+            Assert.assertFalse(map.compareAndPut(42, wrong, "v3"));
+            Assert.assertEquals("v1", map.get(42));
+
+            // (matching, v') → success
+            Assert.assertTrue(map.compareAndPut(42, map.get(42), "v3"));
+            Assert.assertEquals("v3", map.get(42));
+
+            // (_, null) → IllegalArgumentException
+            try {
+                map.compareAndPut(42, map.get(42), null);
+                Assert.fail("expected IllegalArgumentException for null value");
+            } catch (IllegalArgumentException expected) {
+                // OK
+            }
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private Supplier<IntMap<String>>[] factories() {
+        return new Supplier[]{
+                () -> new DenseIntMap<String>(100),
+                () -> new SparseIntMap<String>()
+        };
     }
 
     @Test
