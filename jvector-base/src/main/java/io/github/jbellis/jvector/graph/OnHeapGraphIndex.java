@@ -252,7 +252,7 @@ public class OnHeapGraphIndex implements MutableGraphIndex {
         var layer = layers.get(level);
         return level == 0
                 ? IntStream.range(0, getIdUpperBound()).filter(i -> layer.get(i) != null)
-                : ((SparseIntMap<Neighbors>) layer.neighbors).keysStream();
+                : layer.neighbors.keysStream();
     }
 
     @Override
@@ -274,6 +274,27 @@ public class OnHeapGraphIndex implements MutableGraphIndex {
         // we include the REF_BYTES for the CNS reference here to make it self-contained for addGraphNode()
         int REF_BYTES = RamUsageEstimator.NUM_BYTES_OBJECT_REF;
         return REF_BYTES + Neighbors.ramBytesUsed(layers.get(level).nodeArrayLength());
+    }
+
+    /**
+     * Estimate the per-node graph overhead (in bytes) for a layer with the given degree
+     * parameters, without requiring a built {@link OnHeapGraphIndex} instance.
+     * <p>
+     * Intended for callers (e.g. an external indexing service) that need to predict graph
+     * memory cost when sizing a memory budget. Multiply by the expected node count for that
+     * layer to get a total estimate.
+     *
+     * @param maxDegree     the maximum number of neighbors per node (M in HNSW)
+     * @param overflowRatio the multiplier on {@code maxDegree} that bounds the temporary
+     *                      neighborhood size during construction (matches the value passed to
+     *                      {@link io.github.jbellis.jvector.graph.GraphIndexBuilder})
+     * @return the estimated per-node bytes (one slot reference + {@code Neighbors} object)
+     */
+    public static long estimatedBytesPerNode(int maxDegree, float overflowRatio) {
+        int maxOverflowDegree = (int) (maxDegree * overflowRatio);
+        int nodeArrayLength = maxOverflowDegree + 1; // matches ConcurrentNeighborMap.nodeArrayLength()
+        int REF_BYTES = RamUsageEstimator.NUM_BYTES_OBJECT_REF;
+        return REF_BYTES + Neighbors.ramBytesUsed(nodeArrayLength);
     }
 
     @Override

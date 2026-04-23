@@ -17,6 +17,7 @@ package io.github.jbellis.jvector.util;
 
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReferenceArray;
+import java.util.function.IntConsumer;
 
 /**
  * A map (but not a Map) of int -&gt; T where the int keys are dense-ish and start at zero,
@@ -148,6 +149,19 @@ public class DenseIntMap<T> implements IntMap<T> {
         }
     }
 
+    @Override
+    public void forEachKey(IntConsumer consumer) {
+        for (int i = 0; i < baseLen; i++) {
+            if (base.get(i) != null) {
+                consumer.accept(i);
+            }
+        }
+        Overflow<T> o = overflow;
+        if (o != null) {
+            o.forEachKey(baseLen, consumer);
+        }
+    }
+
     private Overflow<T> overflowForWrite() {
         Overflow<T> o = overflow;
         if (o != null) {
@@ -231,6 +245,22 @@ public class DenseIntMap<T> implements IntMap<T> {
                     T value = seg.get(i);
                     if (value != null) {
                         consumer.consume(baseOffset + segBase + i, value);
+                    }
+                }
+            }
+        }
+
+        void forEachKey(int baseOffset, IntConsumer consumer) {
+            AtomicReferenceArray<AtomicReferenceArray<T>> spineSnap = spine;
+            for (int s = 0; s < spineSnap.length(); s++) {
+                AtomicReferenceArray<T> seg = spineSnap.get(s);
+                if (seg == null) {
+                    continue;
+                }
+                int segBase = s << OVERFLOW_SEGMENT_BITS;
+                for (int i = 0; i < OVERFLOW_SEGMENT_SIZE; i++) {
+                    if (seg.get(i) != null) {
+                        consumer.accept(baseOffset + segBase + i);
                     }
                 }
             }
