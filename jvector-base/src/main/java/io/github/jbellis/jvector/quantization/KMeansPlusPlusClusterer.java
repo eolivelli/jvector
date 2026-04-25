@@ -58,6 +58,16 @@ public class KMeansPlusPlusClusterer {
     private final VectorFloat<?>[] centroidNums; // the sum of all points assigned to each cluster
 
     /**
+     * Reusable scratch buffer for {@link #updateCentroidsUnweighted()}.
+     * Avoids allocating a new {@code VectorFloat} per centroid per Lloyd's iteration
+     * (previously {@code centroidNums[i].copy()} was called k × iterations times per
+     * training run, generating GC pressure proportional to k × dim × iterations).
+     * This instance is never shared across threads; each {@code KMeansPlusPlusClusterer}
+     * is single-threaded by construction.
+     */
+    private final VectorFloat<?> scratchCentroid;
+
+    /**
      * Constructs a KMeansPlusPlusFloatClusterer with the specified points and number of clusters.
      *
      * @param points the points to cluster (points[n][i] is the ith component of the nth point)
@@ -102,6 +112,7 @@ public class KMeansPlusPlusClusterer {
         for (int i = 0; i < centroidNums.length; i++) {
             centroidNums[i] = vectorTypeSupport.createFloatVector(points[0].length());
         }
+        scratchCentroid = vectorTypeSupport.createFloatVector(points[0].length());
         assignments = new int[points.length];
 
         initializeAssignedPoints();
@@ -357,15 +368,18 @@ public class KMeansPlusPlusClusterer {
      * Calculates centroids from centroidNums/centroidDenoms updated during point assignment
      */
     private void updateCentroidsUnweighted() {
+        int dim = scratchCentroid.length();
         for (int i = 0; i < k; i++) {
             var denom = centroidDenoms[i];
             if (denom == 0) {
                 // no points assigned to this cluster
                 initializeCentroidToRandomPoint(i);
             } else {
-                var centroid = centroidNums[i].copy();
-                scale(centroid, 1.0f / centroidDenoms[i]);
-                centroids.copyFrom(centroid, 0, i * centroid.length(), centroid.length());
+                // Reuse the pre-allocated scratch buffer instead of calling centroidNums[i].copy(),
+                // which would allocate a new VectorFloat on every (centroid × iteration) pass.
+                scratchCentroid.copyFrom(centroidNums[i], 0, 0, dim);
+                scale(scratchCentroid, 1.0f / denom);
+                centroids.copyFrom(scratchCentroid, 0, i * dim, dim);
             }
         }
     }
