@@ -207,8 +207,24 @@ public final class OnDiskGraphIndexCompactor implements Accountable {
     /**
      * Main compaction entry point. Merges all source indexes into a single output index at the
      * specified path, handling PQ retraining if needed, and writing header, all layers, and footer.
+     *
+     * <p>Equivalent to {@code compact(outputPath, null)}.
      */
     public void compact(Path outputPath) throws FileNotFoundException {
+        compact(outputPath, null);
+    }
+
+    /**
+     * Main compaction entry point with optional progress reporting. Merges all source indexes into
+     * a single output index at the specified path, handling PQ retraining if needed, and writing
+     * header, all layers, and footer.
+     *
+     * @param outputPath       destination file for the merged graph
+     * @param progressListener optional callback invoked every ten batches (and at completion of
+     *                         each level) so the caller can track I/O progress; pass {@code null}
+     *                         to disable progress reporting
+     */
+    public void compact(Path outputPath, CompactionProgressListener progressListener) throws FileNotFoundException {
         boolean fusedPQEnabled = hasFusedPQ();
         boolean compressedPrecision = fusedPQEnabled;
 
@@ -230,7 +246,7 @@ public final class OnDiskGraphIndexCompactor implements Accountable {
                 numTotalNodes, maxOrdinal, dimension, maxDegrees.get(0));
         try (CompactWriter writer = new CompactWriter(outputPath, maxOrdinal, numTotalNodes, 0, layerInfo, entryNode, dimension, maxDegrees, pq, pqLength, fusedPQEnabled)) {
             writer.writeHeader();
-            compactLevels(writer, similarityFunction, fusedPQEnabled, compressedPrecision, pq);
+            compactLevels(writer, similarityFunction, fusedPQEnabled, compressedPrecision, pq, progressListener);
 
             // When FusedPQ is enabled and there is no hierarchy (only L0), the reader expects
             // to find the entry node's own PQ code written after the L0 block, just as
@@ -304,7 +320,8 @@ public final class OnDiskGraphIndexCompactor implements Accountable {
                                  VectorSimilarityFunction similarityFunction,
                                  boolean fusedPQEnabled,
                                  boolean compressedPrecision,
-                                 ProductQuantization pq)
+                                 ProductQuantization pq,
+                                 CompactionProgressListener progressListener)
             throws IOException, ExecutionException, InterruptedException {
 
         int maxUpperDegree = 0;
@@ -362,7 +379,8 @@ public final class OnDiskGraphIndexCompactor implements Accountable {
                                 } catch (IOException e) {
                                     throw new RuntimeException(e);
                                 }
-                            }
+                            },
+                            progressListener
                     );
                 }
 
@@ -399,7 +417,8 @@ public final class OnDiskGraphIndexCompactor implements Accountable {
                             } catch (IOException e) {
                                 throw new RuntimeException(e);
                             }
-                        }
+                        },
+                        progressListener
                 );
             }
         }
@@ -740,12 +759,17 @@ public final class OnDiskGraphIndexCompactor implements Accountable {
      * Executes batches with controlled concurrency using a sliding window approach. Prevents
      * overwhelming memory by limiting the number of in-flight tasks while maintaining high
      * throughput via the completion service.
+     *
+     * @param progressListener optional; when non-null, called every ten batches (and at the
+     *                         final batch) with {@code (completedBatches, totalBatches)} so
+     *                         the caller can expose live compaction progress
      */
     private <T> void runBatchesWithBackpressure(
             List<BatchSpec> batches,
             ExecutorCompletionService<List<T>> ecs,
             java.util.function.Consumer<BatchSpec> submitOne,
-            java.util.function.Consumer<List<T>> onComplete
+            java.util.function.Consumer<List<T>> onComplete,
+            CompactionProgressListener progressListener
     ) throws InterruptedException, ExecutionException {
 
         final int total = batches.size();
@@ -770,8 +794,11 @@ public final class OnDiskGraphIndexCompactor implements Accountable {
                 submitOne.accept(batches.get(nextToSubmit++));
                 inFlight++;
             }
-            if (completed % 10 == 0) {
+            if (completed % 10 == 0 || completed == total) {
                 log.info("Compaction I/O progress: {}/{} batches written to disk", completed, total);
+                if (progressListener != null) {
+                    progressListener.onProgress(completed, total);
+                }
             }
         }
     }
