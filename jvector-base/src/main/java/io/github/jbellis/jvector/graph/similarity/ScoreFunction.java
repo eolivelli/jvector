@@ -17,6 +17,7 @@
 package io.github.jbellis.jvector.graph.similarity;
 
 import io.github.jbellis.jvector.vector.VectorizationProvider;
+import io.github.jbellis.jvector.vector.types.ByteSequence;
 import io.github.jbellis.jvector.vector.types.VectorTypeSupport;
 
 /**
@@ -57,6 +58,18 @@ public interface ScoreFunction {
      * Load the corresponding data so that similarityToNeighbor can be used with the neighbors of the origin node.
      */
     default void enableSimilarityToNeighbors(int origin) {}
+
+    /**
+     * Variant of {@link #enableSimilarityToNeighbors(int)} that consumes a caller-supplied buffer of
+     * already-loaded neighbor codes. Used by the pipelined search path that pre-fetches the codes
+     * asynchronously while computing similarities for the previous origin.
+     * <p>
+     * Default: ignore the preloaded buffer and fall back to {@link #enableSimilarityToNeighbors(int)},
+     * which lets implementations that don't benefit from preloading remain unchanged.
+     */
+    default void enableSimilarityToNeighbors(int origin, ByteSequence<?> preloadedCodes) {
+        enableSimilarityToNeighbors(origin);
+    }
 
     /**
      * @return true if `similarityToNeighbor` is supported

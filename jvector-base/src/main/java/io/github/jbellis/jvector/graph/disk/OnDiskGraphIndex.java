@@ -38,6 +38,7 @@ import io.github.jbellis.jvector.util.Bits;
 import io.github.jbellis.jvector.util.RamUsageEstimator;
 import io.github.jbellis.jvector.vector.VectorSimilarityFunction;
 import io.github.jbellis.jvector.vector.VectorizationProvider;
+import io.github.jbellis.jvector.vector.types.ByteSequence;
 import io.github.jbellis.jvector.vector.types.VectorFloat;
 import io.github.jbellis.jvector.vector.types.VectorTypeSupport;
 
@@ -48,6 +49,7 @@ import java.util.EnumMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import java.util.function.Function;
@@ -465,6 +467,25 @@ public class OnDiskGraphIndex implements ImmutableGraphIndex, AutoCloseable, Acc
         return (double) sum / it.size();
     }
 
+    /**
+     * Parsed result of {@link View#readPackedNeighborsAsync(int)}. Self-contained — independent of
+     * the View's mutable scratch buffers — so multiple instances can coexist when the search loop
+     * is pipelining reads.
+     */
+    public static final class PackedNeighborData {
+        public final int node;
+        public final ByteSequence<?> codes;
+        public final int[] neighbors;
+        public final int degree;
+
+        PackedNeighborData(int node, ByteSequence<?> codes, int[] neighbors, int degree) {
+            this.node = node;
+            this.codes = codes;
+            this.neighbors = neighbors;
+            this.degree = degree;
+        }
+    }
+
     public class View implements FeatureSource, ScoringView, RandomAccessVectorValues {
         protected final RandomAccessReader reader;
         private final int[] neighbors;
@@ -612,6 +633,57 @@ public class OnDiskGraphIndex implements ImmutableGraphIndex, AutoCloseable, Acc
             } catch (IOException e) {
                 throw new UncheckedIOException(e);
             }
+        }
+
+        /**
+         * @return true if this graph carries a FUSED_PQ feature on layer 0 (i.e. the pipelined
+         *         async search path is applicable).
+         */
+        public boolean hasFusedPQ() {
+            Feature f = features.get(FeatureId.FUSED_PQ);
+            return f != null && f.isFused();
+        }
+
+        /**
+         * Asynchronously read the entire layer-0 block for {@code node} (PQ codes + degree +
+         * neighbor ids) in a single contiguous range. Used by GraphSearcher's pipelined search
+         * path to overlap remote IO with similarity compute.
+         *
+         * <p>The returned {@link PackedNeighborData} is self-contained — it does not share state
+         * with the View's mutable scratch fields, so two reads can be in flight concurrently.
+         *
+         * @throws UnsupportedOperationException if the graph has no FUSED_PQ feature
+         */
+        public CompletableFuture<PackedNeighborData> readPackedNeighborsAsync(int node) {
+            Feature feature = features.get(FeatureId.FUSED_PQ);
+            if (feature == null || !feature.isFused()) {
+                CompletableFuture<PackedNeighborData> failed = new CompletableFuture<>();
+                failed.completeExceptionally(
+                        new UnsupportedOperationException("readPackedNeighborsAsync requires a FusedPQ graph"));
+                return failed;
+            }
+            long start = baseNodeOffsetFor(node);
+            int maxDegree = layerInfo.get(0).degree;
+            int totalLen = Integer.BYTES + inlineBlockSize + Integer.BYTES * (maxDegree + 1);
+            int codesOffset = Integer.BYTES + inlineOffsets.get(FeatureId.FUSED_PQ);
+            int codesLength = feature.featureSize();
+            int degreePos = Integer.BYTES + inlineBlockSize;
+
+            return reader.readRangeAsync(start, totalLen).thenApply(buf -> {
+                int actualDegree = buf.getInt(degreePos);
+                assert actualDegree <= maxDegree
+                        : String.format("Node %d neighborCount %d > M %d", node, actualDegree, maxDegree);
+                int[] nbrs = new int[actualDegree];
+                int idsBase = degreePos + Integer.BYTES;
+                for (int i = 0; i < actualDegree; i++) {
+                    nbrs[i] = buf.getInt(idsBase + Integer.BYTES * i);
+                }
+                ByteSequence<?> codes = vectorTypeSupport.createByteSequence(codesLength);
+                for (int i = 0; i < codesLength; i++) {
+                    codes.set(i, buf.get(codesOffset + i));
+                }
+                return new PackedNeighborData(node, codes, nbrs, actualDegree);
+            });
         }
 
         @Override

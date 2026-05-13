@@ -18,6 +18,7 @@ package io.github.jbellis.jvector.disk;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.util.concurrent.CompletableFuture;
 
 /**
  * This is a subset of DataInput, plus seek and readFully methods, which allows implementations
@@ -127,4 +128,43 @@ public interface RandomAccessReader extends AutoCloseable {
      * @throws IOException if an I/O error occurs
      */
     long length() throws IOException;
+
+    /**
+     * Asynchronously read {@code length} bytes starting at {@code offset}. The returned future
+     * completes with a ByteBuffer positioned at 0 and limited to {@code length}.
+     *
+     * <p>Contract:
+     * <ul>
+     *   <li>Must NOT modify this reader's current seek position.</li>
+     *   <li>Must NOT block the caller waiting for IO to complete. Implementations backed by a
+     *       parallel-capable backend (e.g. a network client) should dispatch the read and return
+     *       the future immediately.</li>
+     *   <li>Multiple async reads may be in flight concurrently. The async path is logically
+     *       routed through a shared backend that bypasses this reader instance's position
+     *       cursor.</li>
+     * </ul>
+     *
+     * <p>The default implementation is a synchronous fallback that saves and restores the current
+     * position around a {@code seek}/{@code readFully} pair, returning a completed future. This
+     * preserves correctness for local file/mmap readers without giving them any actual concurrency
+     * benefit; readers that wrap a non-blocking backend should override.
+     *
+     * @param offset starting offset
+     * @param length number of bytes to read
+     * @return a future completing with the read bytes
+     */
+    default CompletableFuture<ByteBuffer> readRangeAsync(long offset, int length) {
+        try {
+            long saved = getPosition();
+            byte[] bytes = new byte[length];
+            seek(offset);
+            readFully(bytes);
+            seek(saved);
+            return CompletableFuture.completedFuture(ByteBuffer.wrap(bytes));
+        } catch (IOException e) {
+            CompletableFuture<ByteBuffer> failed = new CompletableFuture<>();
+            failed.completeExceptionally(e);
+            return failed;
+        }
+    }
 }
