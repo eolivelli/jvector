@@ -26,6 +26,7 @@ package io.github.jbellis.jvector.graph;
 
 import io.github.jbellis.jvector.annotations.Experimental;
 import io.github.jbellis.jvector.graph.ImmutableGraphIndex.NodeAtLevel;
+import io.github.jbellis.jvector.graph.disk.OnDiskGraphIndex;
 import io.github.jbellis.jvector.graph.similarity.DefaultSearchScoreProvider;
 import io.github.jbellis.jvector.graph.similarity.ScoreFunction;
 import io.github.jbellis.jvector.graph.similarity.SearchScoreProvider;
@@ -42,6 +43,7 @@ import org.agrona.collections.IntHashSet;
 import java.io.Closeable;
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.util.concurrent.CompletableFuture;
 
 
 /**
@@ -65,6 +67,7 @@ public class GraphSearcher implements Closeable {
     private CachingReranker cachingReranker;
 
     private boolean pruneSearch;
+    private boolean asyncPipelineEnabled;
     private final ScoreTracker.ScoreTrackerFactory scoreTrackerFactory;
 
     private int visitedCount;
@@ -126,6 +129,27 @@ public class GraphSearcher implements Closeable {
      */
     public void usePruning(boolean usage) {
         pruneSearch = usage;
+    }
+
+    /**
+     * Enable a 2-slot IO pipeline on the layer-0 FusedPQ search path. When enabled (and the
+     * conditions are met — graph view is an {@link OnDiskGraphIndex.View} with a FUSED_PQ feature,
+     * and the score function supports neighbor-batch similarity), {@link #searchOneLayer} kicks
+     * off an asynchronous read for the next likely-visited node before waiting on the current
+     * node's read. With a {@link io.github.jbellis.jvector.disk.RandomAccessReader} implementation
+     * that overrides {@code readRangeAsync} to issue truly non-blocking IO (e.g. a network-backed
+     * reader), this overlaps remote IO with similarity compute and reduces search wall time.
+     *
+     * <p>With the default synchronous fallback for {@code readRangeAsync}, this mode degrades to
+     * serialized reads with a small per-node {@link CompletableFuture} overhead and per-call
+     * buffer allocation — no concurrency benefit. Leave this disabled for in-memory / mmap
+     * readers; enable it for readers backed by a parallel-capable network client.
+     *
+     * <p>Disabled by default.
+     */
+    @Experimental
+    public void setAsyncPipelineEnabled(boolean enabled) {
+        this.asyncPipelineEnabled = enabled;
     }
 
     /**
@@ -413,6 +437,17 @@ public class GraphSearcher implements Closeable {
                         int level,
                         Bits acceptOrdsThisLayer)
     {
+        // Async-IO pipeline path: only when explicitly enabled and the graph/score-function shape
+        // matches. Falls back to the original synchronous loop otherwise.
+        if (asyncPipelineEnabled
+                && level == 0
+                && scoreProvider.scoreFunction().supportsSimilarityToNeighbors()
+                && view instanceof OnDiskGraphIndex.View
+                && ((OnDiskGraphIndex.View) view).hasFusedPQ()) {
+            searchOneLayerAsync(scoreProvider, rerankK, threshold, acceptOrdsThisLayer);
+            return;
+        }
+
         try {
             assert approximateResults.size() == 0; // should be cleared by setEntryPointsFromPreviousLayer
             approximateResults.setMaxSize(rerankK);
@@ -454,6 +489,112 @@ public class GraphSearcher implements Closeable {
             }
         } catch (Throwable t) {
             // clear scratch structures if terminated via throwable, as they may not have been drained
+            approximateResults.clear();
+            throw t;
+        }
+    }
+
+    /**
+     * 2-slot pipelined variant of {@link #searchOneLayer} for the layer-0 FusedPQ path. While
+     * waiting on the read for the current frontier node, kicks off an asynchronous read for the
+     * next likely-visited node (the heap's top). When the speculative peek matches the heap's
+     * top after the current node's neighbors are scored and pushed, the prefetched future is
+     * consumed for free; when it doesn't, the future's bytes still land in the underlying
+     * reader's block cache (if any) and the search continues correctly.
+     *
+     * <p>Semantics relative to {@link #searchOneLayer}: same nodes are visited in the same order
+     * (popping is deterministic given the heap state), so search results are bit-equivalent. Only
+     * IO scheduling differs.
+     */
+    private void searchOneLayerAsync(SearchScoreProvider scoreProvider,
+                                     int rerankK,
+                                     float threshold,
+                                     Bits acceptOrdsThisLayer) {
+        try {
+            assert approximateResults.size() == 0;
+            approximateResults.setMaxSize(rerankK);
+
+            var scoreTracker = scoreTrackerFactory.getScoreTracker(pruneSearch, rerankK, threshold);
+            OnDiskGraphIndex.View odView = (OnDiskGraphIndex.View) view;
+            var scoreFunction = scoreProvider.scoreFunction();
+
+            if (candidates.size() == 0 || stopSearch(candidates, scoreTracker, rerankK, threshold)) {
+                return;
+            }
+
+            float currentScore = candidates.topScore();
+            int currentNode = candidates.pop();
+            CompletableFuture<OnDiskGraphIndex.PackedNeighborData> currentRead =
+                    odView.readPackedNeighborsAsync(currentNode);
+
+            while (currentRead != null) {
+                // Speculatively start the next read BEFORE waiting on the current one.
+                int peekedNode = -1;
+                float peekedScore = 0f;
+                CompletableFuture<OnDiskGraphIndex.PackedNeighborData> nextRead = null;
+                if (candidates.size() > 0) {
+                    peekedScore = candidates.topScore();
+                    peekedNode = candidates.topNode();
+                    nextRead = odView.readPackedNeighborsAsync(peekedNode);
+                }
+
+                // Park on the current read; the speculative next read overlaps with what follows.
+                OnDiskGraphIndex.PackedNeighborData data = currentRead.join();
+
+                // Result/threshold bookkeeping — identical to the sync path.
+                if (acceptOrdsThisLayer.get(currentNode) && currentScore >= threshold) {
+                    addTopCandidate(currentNode, currentScore, rerankK);
+                }
+
+                // Skip neighbor expansion if shouldStop says we're in drain mode AND we still
+                // have enough queued candidates to fill the result set. Same condition as the
+                // sync path's `continue`.
+                boolean skipExpand = scoreTracker.shouldStop()
+                        && candidates.size() >= rerankK - approximateResults.size();
+
+                if (!skipExpand) {
+                    expandedCountBaseLayer++;
+                    expandedCount++;
+
+                    scoreFunction.enableSimilarityToNeighbors(currentNode, data.codes);
+                    for (int i = 0; i < data.degree; i++) {
+                        int friend = data.neighbors[i];
+                        if (visited.add(friend)) {
+                            float friendSim = scoreFunction.similarityToNeighbor(currentNode, i);
+                            scoreTracker.track(friendSim);
+                            candidates.push(friend, friendSim);
+                            visitedCount++;
+                        }
+                    }
+                }
+
+                // Stop check now that the queue reflects this iteration's pushes.
+                if (candidates.size() == 0
+                        || stopSearch(candidates, scoreTracker, rerankK, threshold)) {
+                    // nextRead (if any) is left to land in the block cache; no leak (on-heap buffers).
+                    break;
+                }
+
+                // Advance the pipeline.
+                if (nextRead == null) {
+                    currentScore = candidates.topScore();
+                    currentNode = candidates.pop();
+                    currentRead = odView.readPackedNeighborsAsync(currentNode);
+                } else if (candidates.topNode() == peekedNode) {
+                    candidates.pop();
+                    currentScore = peekedScore;
+                    currentNode = peekedNode;
+                    currentRead = nextRead;
+                } else {
+                    // Compute step pushed a candidate that displaced peekedNode from the top.
+                    // Drop the speculative result locally; bytes are in the block cache so the
+                    // eventual visit to peekedNode will hit there.
+                    currentScore = candidates.topScore();
+                    currentNode = candidates.pop();
+                    currentRead = odView.readPackedNeighborsAsync(currentNode);
+                }
+            }
+        } catch (Throwable t) {
             approximateResults.clear();
             throw t;
         }

@@ -90,6 +90,14 @@ public abstract class FusedPQDecoder implements ScoreFunction.ApproximateScoreFu
     }
 
     @Override
+    public void enableSimilarityToNeighbors(int origin, ByteSequence<?> preloadedCodes) {
+        if (this.origin != origin) {
+            this.origin = origin;
+            this.neighborCodes.copyFrom(preloadedCodes, 0, 0, preloadedCodes.length());
+        }
+    }
+
+    @Override
     public float similarityTo(int node2) {
         if (!hierarchyCachedFeatures.containsKey(node2)) {
             throw new IllegalArgumentException("Node " + node2 + " is not in the hierarchy");
