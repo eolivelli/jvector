@@ -482,7 +482,16 @@ public class GraphSearcher implements Closeable {
                 var scoreFunction = scoreProvider.scoreFunction();
                 ImmutableGraphIndex.NeighborProcessor neighborProcessor = (node2, score) -> {
                     scoreTracker.track(score);
-                    candidates.push(node2, score);
+                    // A candidate worse than the worst kept result can never be expanded:
+                    // stopSearch() terminates the loop before it reaches the top of the queue,
+                    // and approximateResults.topScore() only rises. Divert it to evictedResults
+                    // so it stays out of the hot candidates heap but is still reconsidered if
+                    // the search is later resume()d.
+                    if (approximateResults.size() >= rerankK && score < approximateResults.topScore()) {
+                        evictedResults.add(node2, score);
+                    } else {
+                        candidates.push(node2, score);
+                    }
                     visitedCount++;
                 };
                 view.processNeighbors(level, topCandidateNode, scoreFunction, visited::add, neighborProcessor);
@@ -562,7 +571,14 @@ public class GraphSearcher implements Closeable {
                         if (visited.add(friend)) {
                             float friendSim = scoreFunction.similarityToNeighbor(currentNode, i);
                             scoreTracker.track(friendSim);
-                            candidates.push(friend, friendSim);
+                            // Same frontier pruning as the sync path: a neighbor worse than the
+                            // worst kept result can never be expanded, so keep it out of the hot
+                            // candidates heap while preserving it in evictedResults for resume().
+                            if (approximateResults.size() >= rerankK && friendSim < approximateResults.topScore()) {
+                                evictedResults.add(friend, friendSim);
+                            } else {
+                                candidates.push(friend, friendSim);
+                            }
                             visitedCount++;
                         }
                     }
