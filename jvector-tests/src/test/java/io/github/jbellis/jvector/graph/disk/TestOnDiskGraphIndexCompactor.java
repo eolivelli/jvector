@@ -52,7 +52,9 @@ import java.nio.file.Path;
 import java.util.*;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ForkJoinPool;
+import java.util.concurrent.ForkJoinWorkerThread;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.IntFunction;
 
 import static io.github.jbellis.jvector.TestUtil.createRandomVectors;
@@ -899,7 +901,7 @@ public class TestOnDiskGraphIndexCompactor extends RandomizedTest {
         for (int i = 0; i < numSources; i++) {
             Path path = testDirectory.resolve("test_graph_" + i);
             TrackingReaderSupplier ts = new TrackingReaderSupplier(
-                    ReaderSupplierFactory.open(path.toAbsolutePath()));
+                    ReaderSupplierFactory.open(path.toAbsolutePath()), null);
             trackingSuppliers.add(ts);
             graphs.add(OnDiskGraphIndex.load(ts));
 
@@ -953,20 +955,101 @@ public class TestOnDiskGraphIndexCompactor extends RandomizedTest {
     }
 
     /**
+     * Regression test for the compaction-failure leak path. When a batch task throws,
+     * {@code runBatchesWithBackpressure} propagates immediately without awaiting the other
+     * in-flight tasks, and {@code compactLevels()} runs its {@code closeAllScratchQuietly()}
+     * cleanup branch. The fix must still close every reader: {@code compactLevels()} cancels
+     * and awaits all submitted tasks before draining its Scratch registry, so no task can
+     * register a Scratch after the drain.
+     *
+     * <p>The test injects an {@link IOException} from {@code read(float[], int, int)} once a
+     * handful of vector reads have run on executor worker threads (i.e. inside
+     * {@code compactLevels()}), forcing {@code compact()} to fail. Once it returns, every
+     * {@link RandomAccessReader} vended to a compaction source — including those created on
+     * worker threads whose tasks were cancelled mid-flight — must be closed.
+     */
+    @Test
+    public void testCompactionFailureClosesAllReaders() throws Exception {
+        List<TrackingReaderSupplier> trackingSuppliers = new ArrayList<>();
+        List<OnDiskGraphIndex> graphs = new ArrayList<>();
+        List<FixedBitSet> liveNodes = new ArrayList<>();
+        List<OrdinalMapper> remappers = new ArrayList<>();
+
+        // After 20 vector reads on executor worker threads (only compactLevels() reads
+        // vectors on worker threads), every further read(float[]) throws — forcing the
+        // compaction to fail partway through, exercising the closeAllScratchQuietly() path.
+        AtomicInteger failCountdown = new AtomicInteger(20);
+
+        int globalOrdinal = 0;
+        for (int i = 0; i < numSources; i++) {
+            Path path = testDirectory.resolve("test_graph_" + i);
+            TrackingReaderSupplier ts = new TrackingReaderSupplier(
+                    ReaderSupplierFactory.open(path.toAbsolutePath()), failCountdown);
+            trackingSuppliers.add(ts);
+            graphs.add(OnDiskGraphIndex.load(ts));
+
+            Map<Integer, Integer> map = new HashMap<>(numVectorsPerGraph);
+            for (int n = 0; n < numVectorsPerGraph; n++) {
+                map.put(n, globalOrdinal++);
+            }
+            remappers.add(new OrdinalMapper.MapMapper(map));
+            FixedBitSet lives = new FixedBitSet(numVectorsPerGraph);
+            lives.set(0, numVectorsPerGraph);
+            liveNodes.add(lives);
+        }
+
+        ForkJoinPool pool = new ForkJoinPool(4);
+        boolean compactionFailed = false;
+        try {
+            OnDiskGraphIndexCompactor compactor = new OnDiskGraphIndexCompactor(
+                    graphs, liveNodes, remappers, similarityFunction, pool);
+            Path outputPath = testDirectory.resolve("test_compact_failure_closes_readers");
+            try {
+                compactor.compact(outputPath);
+            } catch (RuntimeException expected) {
+                // compact() wraps batch-task IOExceptions in a RuntimeException.
+                compactionFailed = true;
+            }
+        } finally {
+            pool.shutdown();
+            assertTrue("compaction pool did not terminate",
+                    pool.awaitTermination(30, TimeUnit.SECONDS));
+        }
+
+        assertTrue("the injected read failure should have made compaction fail",
+                compactionFailed);
+
+        int readersOpened = 0;
+        for (TrackingReaderSupplier ts : trackingSuppliers) {
+            readersOpened += ts.createdCount();
+            assertTrue("every RandomAccessReader must be closed even when compaction fails"
+                    + " (" + ts.openCount() + " still open)", ts.allClosed());
+        }
+        assertTrue("expected the failed compaction to have opened source readers",
+                readersOpened > 0);
+    }
+
+    /**
      * A {@link ReaderSupplier} that wraps a delegate and records every {@link RandomAccessReader}
      * it vends as a {@link TrackingReader}, so a test can assert they were all closed.
+     *
+     * <p>When {@code failCountdown} is non-null, the vended readers throw an
+     * {@link IOException} from {@code read(float[], int, int)} once the countdown is
+     * exhausted by reads issued on executor worker threads — see {@link TrackingReader}.
      */
     private static final class TrackingReaderSupplier implements ReaderSupplier {
         private final ReaderSupplier delegate;
         private final Queue<TrackingReader> readers = new ConcurrentLinkedQueue<>();
+        private final AtomicInteger failCountdown;
 
-        TrackingReaderSupplier(ReaderSupplier delegate) {
+        TrackingReaderSupplier(ReaderSupplier delegate, AtomicInteger failCountdown) {
             this.delegate = delegate;
+            this.failCountdown = failCountdown;
         }
 
         @Override
         public RandomAccessReader get() throws IOException {
-            TrackingReader r = new TrackingReader(delegate.get());
+            TrackingReader r = new TrackingReader(delegate.get(), failCountdown);
             readers.add(r);
             return r;
         }
@@ -999,18 +1082,33 @@ public class TestOnDiskGraphIndexCompactor extends RandomizedTest {
 
     /**
      * A {@link RandomAccessReader} that delegates every call and records whether
-     * {@link #close()} has been invoked.
+     * {@link #close()} has been invoked. When constructed with a non-null
+     * {@code failCountdown}, {@code read(float[], int, int)} throws an {@link IOException}
+     * once the countdown reaches zero — but only for reads issued on an
+     * {@link ForkJoinWorkerThread}, so the injected failure lands inside
+     * {@code OnDiskGraphIndexCompactor.compactLevels()} (the only code that reads vectors
+     * on executor worker threads) and never during the single-threaded setup phase.
      */
     private static final class TrackingReader implements RandomAccessReader {
         private final RandomAccessReader delegate;
+        private final AtomicInteger failCountdown;
         private volatile boolean closed;
 
-        TrackingReader(RandomAccessReader delegate) {
+        TrackingReader(RandomAccessReader delegate, AtomicInteger failCountdown) {
             this.delegate = delegate;
+            this.failCountdown = failCountdown;
         }
 
         boolean isClosed() {
             return closed;
+        }
+
+        private void maybeFail() throws IOException {
+            if (failCountdown != null
+                    && Thread.currentThread() instanceof ForkJoinWorkerThread
+                    && failCountdown.getAndDecrement() <= 0) {
+                throw new IOException("injected compaction read failure");
+            }
         }
 
         @Override
@@ -1065,6 +1163,7 @@ public class TestOnDiskGraphIndexCompactor extends RandomizedTest {
 
         @Override
         public void read(float[] floats, int offset, int count) throws IOException {
+            maybeFail();
             delegate.read(floats, offset, count);
         }
 

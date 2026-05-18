@@ -356,6 +356,11 @@ public final class OnDiskGraphIndexCompactor implements Accountable {
             allScratch.add(scratch);
             return scratch;
         });
+        // Every batch task submitted to `executor` is tracked here so the finally block can
+        // quiesce the executor (cancel + await) before draining `allScratch`. Without this
+        // barrier, when compaction fails an in-flight task that has not yet run the
+        // ThreadLocal supplier could register a fresh Scratch AFTER the drain — leaking it.
+        final Queue<Future<?>> submittedFutures = new ConcurrentLinkedQueue<>();
 
         boolean compactionSucceeded = false;
         try {
@@ -373,10 +378,10 @@ public final class OnDiskGraphIndexCompactor implements Accountable {
                             new ExecutorCompletionService<>(executor);
 
                     java.util.function.Consumer<BatchSpec> submitOne = (bs) -> {
-                        ecs.submit(() -> {
+                        submittedFutures.add(ecs.submit(() -> {
                             Scratch scratch = threadLocalScratch.get();
                             return computeBaseBatch(writer, bs, scratch, params);
-                        });
+                        }));
                     };
 
                     var wropts = EnumSet.of(StandardOpenOption.WRITE, StandardOpenOption.READ);
@@ -414,10 +419,10 @@ public final class OnDiskGraphIndexCompactor implements Accountable {
                             new ExecutorCompletionService<>(executor);
 
                     java.util.function.Consumer<BatchSpec> submitOne = (bs) -> {
-                        ecs.submit(() -> {
+                        submittedFutures.add(ecs.submit(() -> {
                             Scratch scratch = threadLocalScratch.get();
                             return computeUpperBatchForLevel(bs, lvl, scratch, params);
-                        });
+                        }));
                     };
 
                     runBatchesWithBackpressure(
@@ -444,6 +449,10 @@ public final class OnDiskGraphIndexCompactor implements Accountable {
             }
             compactionSucceeded = true;
         } finally {
+            // Quiesce the executor BEFORE draining allScratch: until every submitted task
+            // has terminated, an in-flight task can still run the threadLocalScratch
+            // supplier and register a fresh Scratch that the drain below would miss.
+            awaitAllTasks(submittedFutures);
             // Drop this thread's ThreadLocal entry; worker-thread entries are unreachable
             // here but their Scratch instances are all registered in `allScratch`.
             threadLocalScratch.remove();
@@ -459,17 +468,55 @@ public final class OnDiskGraphIndexCompactor implements Accountable {
     }
 
     /**
+     * Cancels and waits for every batch task submitted to {@code executor}. This MUST run
+     * before {@code allScratch} is drained: until a submitted task has terminated it can
+     * still execute the {@code threadLocalScratch} supplier and {@code allScratch.add(...)}
+     * a fresh Scratch, which the drain would then miss and leak.
+     *
+     * <p>On the normal-completion path every task is already done, so {@code cancel} is a
+     * no-op and {@code get} returns immediately — a cheap barrier. On the failure path the
+     * not-yet-started tasks are cancelled (they never create a Scratch) and the running
+     * ones are awaited (their Scratch is registered and will be drained).
+     */
+    private static void awaitAllTasks(Queue<Future<?>> submittedFutures) {
+        boolean interrupted = false;
+        Future<?> f;
+        while ((f = submittedFutures.poll()) != null) {
+            // No-op for already-completed tasks; interrupts the rest so a failed compaction
+            // need not wait for the whole sliding window to drain naturally.
+            f.cancel(true);
+            if (interrupted) {
+                // Already interrupted: keep cancelling the remainder but do not block.
+                continue;
+            }
+            try {
+                f.get();
+            } catch (CancellationException | ExecutionException ignored) {
+                // We only need the task to have TERMINATED; its result/failure was already
+                // handled by runBatchesWithBackpressure (or is irrelevant once cancelled).
+            } catch (InterruptedException e) {
+                interrupted = true;
+            }
+        }
+        if (interrupted) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    /**
      * Closes every {@link Scratch} created during compaction, regardless of which thread
      * created it. A close failure on one Scratch does not prevent the others from being
      * closed; the first failure is rethrown with any later ones attached as suppressed.
      */
     private static void closeAllScratch(Queue<Scratch> allScratch) throws IOException {
-        IOException firstError = null;
+        Throwable firstError = null;
         Scratch scratch;
         while ((scratch = allScratch.poll()) != null) {
             try {
                 scratch.close();
-            } catch (IOException e) {
+            } catch (IOException | RuntimeException e) {
+                // Catch RuntimeException too: a single Scratch failing to close must not
+                // abort the loop, otherwise every remaining Scratch would leak.
                 if (firstError == null) {
                     firstError = e;
                 } else {
@@ -477,8 +524,10 @@ public final class OnDiskGraphIndexCompactor implements Accountable {
                 }
             }
         }
-        if (firstError != null) {
-            throw firstError;
+        if (firstError instanceof IOException) {
+            throw (IOException) firstError;
+        } else if (firstError instanceof RuntimeException) {
+            throw (RuntimeException) firstError;
         }
     }
 
@@ -491,7 +540,8 @@ public final class OnDiskGraphIndexCompactor implements Accountable {
         while ((scratch = allScratch.poll()) != null) {
             try {
                 scratch.close();
-            } catch (IOException e) {
+            } catch (IOException | RuntimeException e) {
+                // Broad-ish catch on purpose: one bad close must not abort the rest.
                 log.warn("Failed to close compaction Scratch space", e);
             }
         }
@@ -1187,9 +1237,29 @@ public final class OnDiskGraphIndexCompactor implements Accountable {
             this.pqCode = (pq == null) ? null : vectorTypeSupport.createByteSequence(pq.getSubspaceCount());
 
             this.gs = new GraphSearcher[sources.size()];
-            for (int i = 0; i < sources.size(); i++) {
-                gs[i] = new GraphSearcher(sources.get(i));
-                gs[i].usePruning(false);
+            // Each GraphSearcher opens a View (hence a RandomAccessReader) on its source.
+            // If a later source's getView() throws, close the searchers already created so
+            // their readers are not leaked — this Scratch is never returned to the caller,
+            // so it would otherwise never be registered for the compactor's drain.
+            boolean initialised = false;
+            try {
+                for (int i = 0; i < sources.size(); i++) {
+                    gs[i] = new GraphSearcher(sources.get(i));
+                    gs[i].usePruning(false);
+                }
+                initialised = true;
+            } finally {
+                if (!initialised) {
+                    for (GraphSearcher s : gs) {
+                        if (s != null) {
+                            try {
+                                s.close();
+                            } catch (IOException | RuntimeException ignored) {
+                                // best-effort cleanup; the original failure propagates
+                            }
+                        }
+                    }
+                }
             }
         }
 
