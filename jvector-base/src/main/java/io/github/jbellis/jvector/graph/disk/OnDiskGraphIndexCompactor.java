@@ -18,6 +18,7 @@ package io.github.jbellis.jvector.graph.disk;
 
 import java.io.FileNotFoundException;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.file.Path;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
@@ -290,7 +291,14 @@ public final class OnDiskGraphIndexCompactor implements Accountable {
         // maxLevel source; fall back to any live node that is at maxLevel.
         for (int s = 0; s < sources.size(); s++) {
             if (sources.get(s).getMaxLevel() == maxLevel) {
-                int originalEntry = sources.get(s).getView().entryNode().node;
+                // try-with-resources: getView() opens a fresh RandomAccessReader that must
+                // be closed, otherwise it leaks for the lifetime of the underlying storage.
+                int originalEntry;
+                try (var entryView = sources.get(s).getView()) {
+                    originalEntry = entryView.entryNode().node;
+                } catch (IOException e) {
+                    throw new UncheckedIOException(e);
+                }
                 if (liveNodes.get(s).get(originalEntry)) {
                     return new int[]{s, originalEntry};
                 }
@@ -336,32 +344,81 @@ public final class OnDiskGraphIndexCompactor implements Accountable {
         int upperMaxCandidateSize = upperMaxPerSourceTopK * sources.size();
         int maxCandidateSize = Math.max(baseMaxCandidateSize, upperMaxCandidateSize);
         int scratchDegree = Math.max(maxDegrees.get(0), Math.max(1, maxUpperDegree));
-        final ThreadLocal<Scratch> threadLocalScratch = ThreadLocal.withInitial(() ->
-            new Scratch(maxCandidateSize, scratchDegree, dimension, sources, pq)
-        );
+        // Batch tasks run on `executor`, whose worker threads each lazily create their own
+        // Scratch via this ThreadLocal. compactLevels() cannot reach those worker-thread
+        // ThreadLocal entries with threadLocalScratch.get()/remove(), so every Scratch is
+        // registered in `allScratch` and closed in the finally block below. Closing only the
+        // calling thread's Scratch leaks every worker thread's GraphSearchers — and the
+        // RandomAccessReaders behind their Views — for the lifetime of the executor.
+        final Queue<Scratch> allScratch = new ConcurrentLinkedQueue<>();
+        final ThreadLocal<Scratch> threadLocalScratch = ThreadLocal.withInitial(() -> {
+            Scratch scratch = new Scratch(maxCandidateSize, scratchDegree, dimension, sources, pq);
+            allScratch.add(scratch);
+            return scratch;
+        });
 
-        for (int level = 0; level < maxDegrees.size(); level++) {
-            List<BatchSpec> batches = buildBatches(level);
-            int searchTopK = Math.max(MIN_SEARCH_TOP_K, ((maxDegrees.get(level) + sources.size() - 1) / sources.size()) * SEARCH_TOP_K_MULTIPLIER);
-            int beamWidth = Math.max(maxDegrees.get(level), searchTopK) * BEAM_WIDTH_MULTIPLIER;
+        boolean compactionSucceeded = false;
+        try {
+            for (int level = 0; level < maxDegrees.size(); level++) {
+                List<BatchSpec> batches = buildBatches(level);
+                int searchTopK = Math.max(MIN_SEARCH_TOP_K, ((maxDegrees.get(level) + sources.size() - 1) / sources.size()) * SEARCH_TOP_K_MULTIPLIER);
+                int beamWidth = Math.max(maxDegrees.get(level), searchTopK) * BEAM_WIDTH_MULTIPLIER;
 
-            CompactionParams params = new CompactionParams(fusedPQEnabled, compressedPrecision, searchTopK, beamWidth, pq);
+                CompactionParams params = new CompactionParams(fusedPQEnabled, compressedPrecision, searchTopK, beamWidth, pq);
 
-            if (level == 0) {
-                log.info("Compacting level 0 (base layer)");
+                if (level == 0) {
+                    log.info("Compacting level 0 (base layer)");
 
-                ExecutorCompletionService<List<WriteResult>> ecs =
-                        new ExecutorCompletionService<>(executor);
+                    ExecutorCompletionService<List<WriteResult>> ecs =
+                            new ExecutorCompletionService<>(executor);
 
-                java.util.function.Consumer<BatchSpec> submitOne = (bs) -> {
-                    ecs.submit(() -> {
-                        Scratch scratch = threadLocalScratch.get();
-                        return computeBaseBatch(writer, bs, scratch, params);
-                    });
-                };
+                    java.util.function.Consumer<BatchSpec> submitOne = (bs) -> {
+                        ecs.submit(() -> {
+                            Scratch scratch = threadLocalScratch.get();
+                            return computeBaseBatch(writer, bs, scratch, params);
+                        });
+                    };
 
-                var wropts = EnumSet.of(StandardOpenOption.WRITE, StandardOpenOption.READ);
-                try (FileChannel fc = FileChannel.open(writer.getOutputPath(), wropts)) {
+                    var wropts = EnumSet.of(StandardOpenOption.WRITE, StandardOpenOption.READ);
+                    try (FileChannel fc = FileChannel.open(writer.getOutputPath(), wropts)) {
+
+                        runBatchesWithBackpressure(
+                                batches,
+                                ecs,
+                                submitOne,
+                                (results) -> {
+                                    try {
+                                        for (WriteResult r : results) {
+                                            ByteBuffer b = r.data;
+                                            long pos = r.fileOffset;
+                                            while (b.hasRemaining()) {
+                                                int n = fc.write(b, pos);
+                                                pos += n;
+                                            }
+                                        }
+                                    } catch (IOException e) {
+                                        throw new RuntimeException(e);
+                                    }
+                                },
+                                progressListener
+                        );
+                    }
+
+                    writer.offsetAfterInline();
+
+                } else {
+                    final int lvl = level;
+                    log.info("Compacting upper layer {}", level);
+
+                    ExecutorCompletionService<List<UpperLayerWriteResult>> ecs =
+                            new ExecutorCompletionService<>(executor);
+
+                    java.util.function.Consumer<BatchSpec> submitOne = (bs) -> {
+                        ecs.submit(() -> {
+                            Scratch scratch = threadLocalScratch.get();
+                            return computeUpperBatchForLevel(bs, lvl, scratch, params);
+                        });
+                    };
 
                     runBatchesWithBackpressure(
                             batches,
@@ -369,13 +426,13 @@ public final class OnDiskGraphIndexCompactor implements Accountable {
                             submitOne,
                             (results) -> {
                                 try {
-                                    for (WriteResult r : results) {
-                                        ByteBuffer b = r.data;
-                                        long pos = r.fileOffset;
-                                        while (b.hasRemaining()) {
-                                            int n = fc.write(b, pos);
-                                            pos += n;
-                                        }
+                                    for (UpperLayerWriteResult r : results) {
+                                        writer.writeUpperLayerNode(
+                                                lvl,
+                                                r.ordinal,
+                                                r.neighbors,
+                                                r.pqCode
+                                        );
                                     }
                                 } catch (IOException e) {
                                     throw new RuntimeException(e);
@@ -384,49 +441,60 @@ public final class OnDiskGraphIndexCompactor implements Accountable {
                             progressListener
                     );
                 }
-
-                writer.offsetAfterInline();
-
+            }
+            compactionSucceeded = true;
+        } finally {
+            // Drop this thread's ThreadLocal entry; worker-thread entries are unreachable
+            // here but their Scratch instances are all registered in `allScratch`.
+            threadLocalScratch.remove();
+            if (compactionSucceeded) {
+                // No primary exception in flight, so a close failure can be surfaced safely.
+                closeAllScratch(allScratch);
             } else {
-                final int lvl = level;
-                log.info("Compacting upper layer {}", level);
-
-                ExecutorCompletionService<List<UpperLayerWriteResult>> ecs =
-                        new ExecutorCompletionService<>(executor);
-
-                java.util.function.Consumer<BatchSpec> submitOne = (bs) -> {
-                    ecs.submit(() -> {
-                        Scratch scratch = threadLocalScratch.get();
-                        return computeUpperBatchForLevel(bs, lvl, scratch, params);
-                    });
-                };
-
-                runBatchesWithBackpressure(
-                        batches,
-                        ecs,
-                        submitOne,
-                        (results) -> {
-                            try {
-                                for (UpperLayerWriteResult r : results) {
-                                    writer.writeUpperLayerNode(
-                                            lvl,
-                                            r.ordinal,
-                                            r.neighbors,
-                                            r.pqCode
-                                    );
-                                }
-                            } catch (IOException e) {
-                                throw new RuntimeException(e);
-                            }
-                        },
-                        progressListener
-                );
+                // A primary exception is already propagating; close best-effort so a
+                // secondary close failure does not mask the original cause.
+                closeAllScratchQuietly(allScratch);
             }
         }
+    }
 
-        Scratch s = threadLocalScratch.get();
-        s.close();
-        threadLocalScratch.remove();
+    /**
+     * Closes every {@link Scratch} created during compaction, regardless of which thread
+     * created it. A close failure on one Scratch does not prevent the others from being
+     * closed; the first failure is rethrown with any later ones attached as suppressed.
+     */
+    private static void closeAllScratch(Queue<Scratch> allScratch) throws IOException {
+        IOException firstError = null;
+        Scratch scratch;
+        while ((scratch = allScratch.poll()) != null) {
+            try {
+                scratch.close();
+            } catch (IOException e) {
+                if (firstError == null) {
+                    firstError = e;
+                } else {
+                    firstError.addSuppressed(e);
+                }
+            }
+        }
+        if (firstError != null) {
+            throw firstError;
+        }
+    }
+
+    /**
+     * Like {@link #closeAllScratch} but never throws — used when a primary exception is
+     * already propagating, so a close failure is logged instead of masking the cause.
+     */
+    private static void closeAllScratchQuietly(Queue<Scratch> allScratch) {
+        Scratch scratch;
+        while ((scratch = allScratch.poll()) != null) {
+            try {
+                scratch.close();
+            } catch (IOException e) {
+                log.warn("Failed to close compaction Scratch space", e);
+            }
+        }
     }
 
     /**

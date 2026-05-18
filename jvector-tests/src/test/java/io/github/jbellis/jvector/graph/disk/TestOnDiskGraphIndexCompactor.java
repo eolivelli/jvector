@@ -19,6 +19,7 @@ package io.github.jbellis.jvector.graph.disk;
 import com.carrotsearch.randomizedtesting.RandomizedTest;
 import com.carrotsearch.randomizedtesting.annotations.ThreadLeakScope;
 import io.github.jbellis.jvector.TestUtil;
+import io.github.jbellis.jvector.disk.RandomAccessReader;
 import io.github.jbellis.jvector.disk.ReaderSupplier;
 import io.github.jbellis.jvector.disk.ReaderSupplierFactory;
 import io.github.jbellis.jvector.disk.SimpleMappedReader;
@@ -45,10 +46,13 @@ import org.junit.Before;
 import org.junit.Test;
 
 import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ForkJoinPool;
+import java.util.concurrent.TimeUnit;
 import java.util.function.IntFunction;
 
 import static io.github.jbellis.jvector.TestUtil.createRandomVectors;
@@ -865,5 +869,214 @@ public class TestOnDiskGraphIndexCompactor extends RandomizedTest {
         assertTrue("Search should return results", result.getNodes().length > 0);
 
         searcher.close();
+    }
+
+    /**
+     * Regression test for the compaction reader leak: {@code compactLevels()} ran batch
+     * tasks on a (possibly caller-owned) executor whose worker threads each lazily created
+     * a {@code Scratch} — one {@code GraphSearcher}, hence one {@link RandomAccessReader},
+     * per source. Only the calling thread's {@code Scratch} was closed, so every worker
+     * thread's readers leaked for the lifetime of the executor. With a remote-backed
+     * reader (HerdDB's {@code RemoteRandomAccessReader}) each leaked reader pins an
+     * off-heap block buffer, eventually exhausting the memory budget.
+     *
+     * <p>The test compacts several FusedPQ sources on a caller-owned multi-threaded
+     * {@link ForkJoinPool} (so the compactor does not shut it down and worker-thread
+     * {@code Scratch} instances genuinely outlive {@code compact()}), wrapping every
+     * source's {@link ReaderSupplier} so each {@link RandomAccessReader} it vends records
+     * whether it was closed. Once {@code compact()} returns, every reader opened against a
+     * source — including those created on executor worker threads — must be closed.
+     */
+    @Test
+    public void testCompactionClosesAllReaders() throws Exception {
+        // Source graphs test_graph_0..numSources-1 were written by buildFusedPQ() in setup().
+        List<TrackingReaderSupplier> trackingSuppliers = new ArrayList<>();
+        List<OnDiskGraphIndex> graphs = new ArrayList<>();
+        List<FixedBitSet> liveNodes = new ArrayList<>();
+        List<OrdinalMapper> remappers = new ArrayList<>();
+
+        int globalOrdinal = 0;
+        for (int i = 0; i < numSources; i++) {
+            Path path = testDirectory.resolve("test_graph_" + i);
+            TrackingReaderSupplier ts = new TrackingReaderSupplier(
+                    ReaderSupplierFactory.open(path.toAbsolutePath()));
+            trackingSuppliers.add(ts);
+            graphs.add(OnDiskGraphIndex.load(ts));
+
+            Map<Integer, Integer> map = new HashMap<>(numVectorsPerGraph);
+            for (int n = 0; n < numVectorsPerGraph; n++) {
+                map.put(n, globalOrdinal++);
+            }
+            remappers.add(new OrdinalMapper.MapMapper(map));
+            FixedBitSet lives = new FixedBitSet(numVectorsPerGraph);
+            lives.set(0, numVectorsPerGraph);
+            liveNodes.add(lives);
+        }
+
+        // OnDiskGraphIndex.load() opens its readers inside try-with-resources, so all
+        // readers created so far must already be closed before compaction starts.
+        int readersBeforeCompact = 0;
+        for (TrackingReaderSupplier ts : trackingSuppliers) {
+            readersBeforeCompact += ts.createdCount();
+            assertTrue("readers opened by OnDiskGraphIndex.load() must be closed before"
+                    + " compaction (" + ts.openCount() + " still open)", ts.allClosed());
+        }
+
+        // Caller-owned pool: the compactor sees executor != null, so ownsExecutor is false
+        // and it never shuts the pool down. The worker threads — and any Scratch they
+        // create — therefore outlive compact(); a leaked worker-thread Scratch would leave
+        // its readers open after compact() returns.
+        ForkJoinPool pool = new ForkJoinPool(4);
+        try {
+            OnDiskGraphIndexCompactor compactor = new OnDiskGraphIndexCompactor(
+                    graphs, liveNodes, remappers, similarityFunction, pool);
+            Path outputPath = testDirectory.resolve("test_compact_closes_readers");
+            compactor.compact(outputPath);
+        } finally {
+            pool.shutdown();
+            assertTrue("compaction pool did not terminate",
+                    pool.awaitTermination(30, TimeUnit.SECONDS));
+        }
+
+        int readersAfterCompact = 0;
+        for (TrackingReaderSupplier ts : trackingSuppliers) {
+            readersAfterCompact += ts.createdCount();
+            assertTrue("every RandomAccessReader opened against a compaction source must be"
+                    + " closed once compact() returns (" + ts.openCount() + " still open)",
+                    ts.allClosed());
+        }
+        // Guard against a vacuous pass: compaction must actually open source readers
+        // (Scratch GraphSearchers + resolveEntryNodeSource), otherwise the assertions
+        // above would hold trivially even if the leak were still present.
+        assertTrue("expected compaction to open additional source readers",
+                readersAfterCompact > readersBeforeCompact);
+    }
+
+    /**
+     * A {@link ReaderSupplier} that wraps a delegate and records every {@link RandomAccessReader}
+     * it vends as a {@link TrackingReader}, so a test can assert they were all closed.
+     */
+    private static final class TrackingReaderSupplier implements ReaderSupplier {
+        private final ReaderSupplier delegate;
+        private final Queue<TrackingReader> readers = new ConcurrentLinkedQueue<>();
+
+        TrackingReaderSupplier(ReaderSupplier delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override
+        public RandomAccessReader get() throws IOException {
+            TrackingReader r = new TrackingReader(delegate.get());
+            readers.add(r);
+            return r;
+        }
+
+        @Override
+        public void close() throws IOException {
+            delegate.close();
+        }
+
+        /** Total number of readers vended so far. */
+        int createdCount() {
+            return readers.size();
+        }
+
+        /** Number of vended readers that have not been closed. */
+        int openCount() {
+            int open = 0;
+            for (TrackingReader r : readers) {
+                if (!r.isClosed()) {
+                    open++;
+                }
+            }
+            return open;
+        }
+
+        boolean allClosed() {
+            return openCount() == 0;
+        }
+    }
+
+    /**
+     * A {@link RandomAccessReader} that delegates every call and records whether
+     * {@link #close()} has been invoked.
+     */
+    private static final class TrackingReader implements RandomAccessReader {
+        private final RandomAccessReader delegate;
+        private volatile boolean closed;
+
+        TrackingReader(RandomAccessReader delegate) {
+            this.delegate = delegate;
+        }
+
+        boolean isClosed() {
+            return closed;
+        }
+
+        @Override
+        public void seek(long offset) throws IOException {
+            delegate.seek(offset);
+        }
+
+        @Override
+        public long getPosition() throws IOException {
+            return delegate.getPosition();
+        }
+
+        @Override
+        public int readInt() throws IOException {
+            return delegate.readInt();
+        }
+
+        @Override
+        public float readFloat() throws IOException {
+            return delegate.readFloat();
+        }
+
+        @Override
+        public long readLong() throws IOException {
+            return delegate.readLong();
+        }
+
+        @Override
+        public void readFully(byte[] bytes) throws IOException {
+            delegate.readFully(bytes);
+        }
+
+        @Override
+        public void readFully(ByteBuffer buffer) throws IOException {
+            delegate.readFully(buffer);
+        }
+
+        @Override
+        public void readFully(float[] floats) throws IOException {
+            delegate.readFully(floats);
+        }
+
+        @Override
+        public void readFully(long[] vector) throws IOException {
+            delegate.readFully(vector);
+        }
+
+        @Override
+        public void read(int[] ints, int offset, int count) throws IOException {
+            delegate.read(ints, offset, count);
+        }
+
+        @Override
+        public void read(float[] floats, int offset, int count) throws IOException {
+            delegate.read(floats, offset, count);
+        }
+
+        @Override
+        public long length() throws IOException {
+            return delegate.length();
+        }
+
+        @Override
+        public void close() throws IOException {
+            closed = true;
+            delegate.close();
+        }
     }
 }
