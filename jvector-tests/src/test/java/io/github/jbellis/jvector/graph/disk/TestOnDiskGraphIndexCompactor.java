@@ -54,6 +54,7 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.ForkJoinWorkerThread;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.IntFunction;
 
@@ -901,7 +902,7 @@ public class TestOnDiskGraphIndexCompactor extends RandomizedTest {
         for (int i = 0; i < numSources; i++) {
             Path path = testDirectory.resolve("test_graph_" + i);
             TrackingReaderSupplier ts = new TrackingReaderSupplier(
-                    ReaderSupplierFactory.open(path.toAbsolutePath()), null);
+                    ReaderSupplierFactory.open(path.toAbsolutePath()), null, null);
             trackingSuppliers.add(ts);
             graphs.add(OnDiskGraphIndex.load(ts));
 
@@ -984,7 +985,7 @@ public class TestOnDiskGraphIndexCompactor extends RandomizedTest {
         for (int i = 0; i < numSources; i++) {
             Path path = testDirectory.resolve("test_graph_" + i);
             TrackingReaderSupplier ts = new TrackingReaderSupplier(
-                    ReaderSupplierFactory.open(path.toAbsolutePath()), failCountdown);
+                    ReaderSupplierFactory.open(path.toAbsolutePath()), failCountdown, null);
             trackingSuppliers.add(ts);
             graphs.add(OnDiskGraphIndex.load(ts));
 
@@ -1030,26 +1031,114 @@ public class TestOnDiskGraphIndexCompactor extends RandomizedTest {
     }
 
     /**
+     * Regression test for intra-{@code Scratch} close resilience. {@code Scratch.close()}
+     * closes one {@code GraphSearcher} per source; if one {@code GraphSearcher.close()}
+     * (i.e. its reader's {@code close()}) throws, the remaining searchers must still be
+     * closed — otherwise their {@link RandomAccessReader}s leak. With a remote-backed
+     * reader a {@code close()} {@link IOException} is plausible.
+     *
+     * <p>The test makes source 0's readers throw from {@code close()} (only for readers
+     * created on executor worker threads — i.e. the {@code Scratch} readers, so the
+     * single-threaded setup and entry-node paths are unaffected), then asserts that after
+     * the compaction every reader of every <em>other</em> source was still closed, and
+     * that source 0's readers each had {@code close()} attempted.
+     */
+    @Test
+    public void testCompactionSurvivesReaderCloseFailure() throws Exception {
+        List<TrackingReaderSupplier> trackingSuppliers = new ArrayList<>();
+        List<OnDiskGraphIndex> graphs = new ArrayList<>();
+        List<FixedBitSet> liveNodes = new ArrayList<>();
+        List<OrdinalMapper> remappers = new ArrayList<>();
+
+        // Armed only after OnDiskGraphIndex.load() so the setup-phase readers close cleanly.
+        AtomicBoolean failOnClose = new AtomicBoolean(false);
+
+        int globalOrdinal = 0;
+        for (int i = 0; i < numSources; i++) {
+            Path path = testDirectory.resolve("test_graph_" + i);
+            // Only source 0's worker-thread readers throw from close().
+            TrackingReaderSupplier ts = new TrackingReaderSupplier(
+                    ReaderSupplierFactory.open(path.toAbsolutePath()), null,
+                    i == 0 ? failOnClose : null);
+            trackingSuppliers.add(ts);
+            graphs.add(OnDiskGraphIndex.load(ts));
+
+            Map<Integer, Integer> map = new HashMap<>(numVectorsPerGraph);
+            for (int n = 0; n < numVectorsPerGraph; n++) {
+                map.put(n, globalOrdinal++);
+            }
+            remappers.add(new OrdinalMapper.MapMapper(map));
+            FixedBitSet lives = new FixedBitSet(numVectorsPerGraph);
+            lives.set(0, numVectorsPerGraph);
+            liveNodes.add(lives);
+        }
+
+        // Arm the close failure now that load() (single-threaded) has finished.
+        failOnClose.set(true);
+
+        ForkJoinPool pool = new ForkJoinPool(4);
+        boolean compactRaised = false;
+        try {
+            OnDiskGraphIndexCompactor compactor = new OnDiskGraphIndexCompactor(
+                    graphs, liveNodes, remappers, similarityFunction, pool);
+            Path outputPath = testDirectory.resolve("test_compact_close_failure");
+            try {
+                compactor.compact(outputPath);
+            } catch (RuntimeException expected) {
+                // closeAllScratch surfaces the injected close() IOException on the
+                // success path; compact() rewraps it as a RuntimeException.
+                compactRaised = true;
+            }
+        } finally {
+            pool.shutdown();
+            assertTrue("compaction pool did not terminate",
+                    pool.awaitTermination(30, TimeUnit.SECONDS));
+        }
+
+        assertTrue("the injected reader close() failure should surface from compact()",
+                compactRaised);
+
+        // Resilience: a failing close() on source 0 must not prevent the other sources'
+        // readers from being closed, and source 0's own readers must each have had
+        // close() attempted.
+        int readersOpened = 0;
+        for (int i = 0; i < numSources; i++) {
+            TrackingReaderSupplier ts = trackingSuppliers.get(i);
+            readersOpened += ts.createdCount();
+            assertTrue("source " + i + " has " + ts.openCount() + " reader(s) whose"
+                    + " close() was never attempted despite a close failure elsewhere",
+                    ts.allClosed());
+        }
+        assertTrue("expected the compaction to have opened source readers",
+                readersOpened > 0);
+    }
+
+    /**
      * A {@link ReaderSupplier} that wraps a delegate and records every {@link RandomAccessReader}
      * it vends as a {@link TrackingReader}, so a test can assert they were all closed.
      *
      * <p>When {@code failCountdown} is non-null, the vended readers throw an
      * {@link IOException} from {@code read(float[], int, int)} once the countdown is
-     * exhausted by reads issued on executor worker threads — see {@link TrackingReader}.
+     * exhausted by reads issued on executor worker threads. When {@code failOnClose} is
+     * non-null and set, worker-thread-created readers throw an {@link IOException} from
+     * {@code close()}. See {@link TrackingReader}.
      */
     private static final class TrackingReaderSupplier implements ReaderSupplier {
         private final ReaderSupplier delegate;
         private final Queue<TrackingReader> readers = new ConcurrentLinkedQueue<>();
         private final AtomicInteger failCountdown;
+        private final AtomicBoolean failOnClose;
 
-        TrackingReaderSupplier(ReaderSupplier delegate, AtomicInteger failCountdown) {
+        TrackingReaderSupplier(ReaderSupplier delegate, AtomicInteger failCountdown,
+                               AtomicBoolean failOnClose) {
             this.delegate = delegate;
             this.failCountdown = failCountdown;
+            this.failOnClose = failOnClose;
         }
 
         @Override
         public RandomAccessReader get() throws IOException {
-            TrackingReader r = new TrackingReader(delegate.get(), failCountdown);
+            TrackingReader r = new TrackingReader(delegate.get(), failCountdown, failOnClose);
             readers.add(r);
             return r;
         }
@@ -1088,15 +1177,25 @@ public class TestOnDiskGraphIndexCompactor extends RandomizedTest {
      * {@link ForkJoinWorkerThread}, so the injected failure lands inside
      * {@code OnDiskGraphIndexCompactor.compactLevels()} (the only code that reads vectors
      * on executor worker threads) and never during the single-threaded setup phase.
+     *
+     * <p>When constructed with a non-null {@code failOnClose} that is set, {@link #close()}
+     * throws an {@link IOException} — but only for readers created on a worker thread (the
+     * {@code Scratch} readers), so the setup phase and the calling-thread entry-node path
+     * close cleanly. The delegate is always closed first, so no real resource leaks.
      */
     private static final class TrackingReader implements RandomAccessReader {
         private final RandomAccessReader delegate;
         private final AtomicInteger failCountdown;
+        private final AtomicBoolean failOnClose;
+        private final boolean createdByWorkerThread;
         private volatile boolean closed;
 
-        TrackingReader(RandomAccessReader delegate, AtomicInteger failCountdown) {
+        TrackingReader(RandomAccessReader delegate, AtomicInteger failCountdown,
+                       AtomicBoolean failOnClose) {
             this.delegate = delegate;
             this.failCountdown = failCountdown;
+            this.failOnClose = failOnClose;
+            this.createdByWorkerThread = Thread.currentThread() instanceof ForkJoinWorkerThread;
         }
 
         boolean isClosed() {
@@ -1176,6 +1275,9 @@ public class TestOnDiskGraphIndexCompactor extends RandomizedTest {
         public void close() throws IOException {
             closed = true;
             delegate.close();
+            if (failOnClose != null && failOnClose.get() && createdByWorkerThread) {
+                throw new IOException("injected reader close failure");
+            }
         }
     }
 }

@@ -402,7 +402,7 @@ public final class OnDiskGraphIndexCompactor implements Accountable {
                                             }
                                         }
                                     } catch (IOException e) {
-                                        throw new RuntimeException(e);
+                                        throw new UncheckedIOException(e);
                                     }
                                 },
                                 progressListener
@@ -440,7 +440,7 @@ public final class OnDiskGraphIndexCompactor implements Accountable {
                                         );
                                     }
                                 } catch (IOException e) {
-                                    throw new RuntimeException(e);
+                                    throw new UncheckedIOException(e);
                                 }
                             },
                             progressListener
@@ -1264,12 +1264,35 @@ public final class OnDiskGraphIndexCompactor implements Accountable {
         }
 
         /**
-         * Closes all graph searchers and resets the cache.
+         * Closes all graph searchers and resets the cache. Every searcher is closed even
+         * if one throws, otherwise a single failing GraphSearcher.close() would leak the
+         * RandomAccessReaders behind the remaining searchers' Views; the first failure is
+         * rethrown with any later ones attached as suppressed.
          */
         @Override
         public void close() throws IOException {
-            for (var s : gs) s.close();
+            Throwable firstError = null;
+            for (GraphSearcher s : gs) {
+                // The constructor may leave a trailing null slot if it failed partway.
+                if (s == null) {
+                    continue;
+                }
+                try {
+                    s.close();
+                } catch (IOException | RuntimeException e) {
+                    if (firstError == null) {
+                        firstError = e;
+                    } else {
+                        firstError.addSuppressed(e);
+                    }
+                }
+            }
             selectedCache.reset();
+            if (firstError instanceof IOException) {
+                throw (IOException) firstError;
+            } else if (firstError instanceof RuntimeException) {
+                throw (RuntimeException) firstError;
+            }
         }
     }
 
