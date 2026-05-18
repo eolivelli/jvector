@@ -537,6 +537,101 @@ public class TestOnDiskGraphIndexCompactor extends RandomizedTest {
     }
 
     /**
+     * Builds a FusedPQ-enabled source graph from the given vectors and writes it
+     * to {@code name} under the test directory. Mirrors {@link #buildFusedPQ()}
+     * but is parameterised so a test can create an arbitrary number of sources.
+     */
+    private Path buildFusedPQSource(List<VectorFloat<?>> vecs, String name) throws IOException {
+        RandomAccessVectorValues ravv = new ListRandomAccessVectorValues(vecs, dimension);
+        ProductQuantization pq = ProductQuantization.compute(ravv, 8, 256, true, UNWEIGHTED, simdExecutor, parallelExecutor);
+        PQVectors pqv = (PQVectors) pq.encodeAll(ravv, simdExecutor);
+        var bsp = BuildScoreProvider.pqBuildScoreProvider(similarityFunction, pqv);
+        var builder = new GraphIndexBuilder(bsp, dimension, 16, 100, 1.2f, 1.2f, false, true, simdExecutor, parallelExecutor);
+        var graph = builder.getGraph();
+
+        var outputPath = testDirectory.resolve(name);
+        Map<FeatureId, IntFunction<Feature.State>> writeSuppliers = new EnumMap<>(FeatureId.class);
+        writeSuppliers.put(FeatureId.INLINE_VECTORS, ordinal -> new InlineVectors.State(ravv.getVector(ordinal)));
+
+        var identityMapper = new OrdinalMapper.IdentityMapper(ravv.size() - 1);
+        var writerBuilder = new OnDiskGraphIndexWriter.Builder(graph, outputPath);
+        writerBuilder.withMapper(identityMapper);
+        writerBuilder.with(new InlineVectors(dimension));
+        writerBuilder.with(new FusedPQ(graph.maxDegree(), pq));
+        var writer = writerBuilder.build();
+
+        for (var node = 0; node < ravv.size(); node++) {
+            var stateMap = new EnumMap<FeatureId, Feature.State>(FeatureId.class);
+            stateMap.put(FeatureId.INLINE_VECTORS, writeSuppliers.get(FeatureId.INLINE_VECTORS).apply(node));
+            writer.writeInline(node, stateMap);
+            builder.addGraphNode(node, ravv.getVector(node));
+        }
+        builder.cleanup();
+
+        writeSuppliers.put(FeatureId.FUSED_PQ, ordinal -> new FusedPQ.State(graph.getView(), pqv, ordinal));
+        writer.write(writeSuppliers);
+        return outputPath;
+    }
+
+    /**
+     * Exercises the parallel PQ-retraining path (issue #587): with many FusedPQ
+     * sources, {@code PQRetrainer.extractVectorsSequential} reads each source on
+     * its own thread/View. This test compacts more sources than the default
+     * {@code testCompact} uses, then verifies that every source's inline vectors
+     * survive the compaction exactly at their remapped ordinals — proving the
+     * concurrent extraction did not throw, deadlock, drop, or mis-assign vectors.
+     */
+    @Test
+    public void testCompactManySourcesParallelRetrain() throws Exception {
+        final int sourceCount = 8;
+        final int nodesPerSource = 256;
+
+        List<OnDiskGraphIndex> graphs = new ArrayList<>();
+        List<ReaderSupplier> rss = new ArrayList<>();
+        List<FixedBitSet> liveNodes = new ArrayList<>();
+        List<OrdinalMapper> remappers = new ArrayList<>();
+        // expected[globalOrdinal] -> original vector
+        List<VectorFloat<?>> expected = new ArrayList<>();
+
+        int globalOrdinal = 0;
+        for (int s = 0; s < sourceCount; s++) {
+            List<VectorFloat<?>> vecs = createRandomVectors(nodesPerSource, dimension);
+            Path path = buildFusedPQSource(vecs, "parallel_retrain_src_" + s);
+
+            ReaderSupplier rs = ReaderSupplierFactory.open(path);
+            rss.add(rs);
+            graphs.add(OnDiskGraphIndex.load(rs));
+
+            Map<Integer, Integer> map = new HashMap<>(nodesPerSource);
+            for (int i = 0; i < nodesPerSource; i++) {
+                map.put(i, globalOrdinal++);
+                expected.add(vecs.get(i));
+            }
+            remappers.add(new OrdinalMapper.MapMapper(map));
+
+            FixedBitSet live = new FixedBitSet(nodesPerSource);
+            live.set(0, nodesPerSource);
+            liveNodes.add(live);
+        }
+
+        var compactor = new OnDiskGraphIndexCompactor(graphs, liveNodes, remappers, similarityFunction, null);
+        Path outPath = testDirectory.resolve("parallel_retrain_out");
+        compactor.compact(outPath);
+
+        ReaderSupplier rsOut = ReaderSupplierFactory.open(outPath);
+        OnDiskGraphIndex compacted = OnDiskGraphIndex.load(rsOut);
+        assertEquals("compacted graph must contain every source's nodes",
+                sourceCount * nodesPerSource, compacted.size(0));
+
+        var view = compacted.getView();
+        VectorFloat<?> buf = vectorTypeSupport.createFloatVector(dimension);
+        for (int ord = 0; ord < expected.size(); ord++) {
+            view.getVectorInto(ord, buf, 0);
+            assertVecEquals(expected.get(ord), buf, ord);
+        }
+    }
+
+    /**
      * Tests compaction with deleted nodes.
      * Verifies that deleted nodes are properly excluded from the compacted graph.
      */
