@@ -29,10 +29,19 @@ import io.github.jbellis.jvector.vector.types.VectorTypeSupport;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Handles Product Quantization retraining for graph index compaction.
@@ -47,6 +56,18 @@ public class PQRetrainer {
     // Keeping reads sequential within each chunk lets the OS read-ahead cover them,
     // avoiding the random I/O that would happen with per-node random sampling.
     private static final int SAMPLE_CHUNK_SIZE = 32;
+
+    // Maximum number of source segments whose training vectors are extracted
+    // concurrently. Each source is read by a single thread using its own View,
+    // so this is the number of remote-storage reads that can be in flight at
+    // once. Defaults to 16; overridable via the system property below for
+    // deployments backed by slower or faster storage. Clamped to >= 1.
+    private static final int IO_THREADS = Math.max(1,
+            Integer.getInteger("jvector.pq.retrain.io.threads", 16));
+
+    // Emit a progress log line every this many extracted training vectors, so
+    // a slow-but-progressing extraction can be distinguished from a hang.
+    private static final int PROGRESS_LOG_INTERVAL = 10_000;
 
     private final List<OnDiskGraphIndex> sources;
     private final List<FixedBitSet> liveNodes;
@@ -80,16 +101,15 @@ public class PQRetrainer {
         List<SampleRef> samples = sampleBalanced(ProductQuantization.MAX_PQ_TRAINING_SET_SIZE);
 
         // Sort by (source, node) so extractVectorsSequential reads each source's file
-        // in ascending order, enabling OS read-ahead instead of random page faults.
+        // in ascending order, enabling read-ahead instead of random page faults.
         samples.sort(Comparator.comparingInt((SampleRef r) -> r.source).thenComparingInt(r -> r.node));
 
         log.info("Collected {} training samples", samples.size());
 
-        // Extract vectors sequentially in sorted (source, node) order so disk reads are
-        // purely sequential and the OS read-ahead can cover them efficiently.  We do this
-        // here rather than letting ProductQuantization.compute() drive the reads via its
-        // parallel stream, which would scatter page faults across a potentially very large
-        // file and cause I/O that scales with dataset size rather than sample count.
+        // Extract vectors up front so ProductQuantization.compute() itself performs no
+        // I/O. extractVectorsSequential reads each source ascending (read-ahead friendly)
+        // and reads distinct sources concurrently so the per-read latency of remote
+        // storage is hidden instead of serialized across thousands of samples.
         List<VectorFloat<?>> trainingVectors = extractVectorsSequential(samples);
         var ravv = new ListRandomAccessVectorValues(trainingVectors, dimension);
 
@@ -198,22 +218,100 @@ public class PQRetrainer {
     }
 
     /**
-     * Reads sampled vectors in the order provided. The caller must pre-sort {@code samples}
-     * by (source, node) so reads within each source are ascending, letting the OS read-ahead
-     * cover them efficiently. Each source's view is opened once and reused for all its samples.
+     * Reads the sampled vectors into memory.
+     *
+     * <p>The caller pre-sorts {@code samples} by (source, node) so each source's
+     * sub-list is contiguous and ascending. Sources are then extracted
+     * <em>concurrently</em>: each source is processed by a single worker thread
+     * using its own {@link OnDiskGraphIndex.View} (and therefore its own
+     * {@code RandomAccessReader}), so concurrent reads are safe and up to
+     * {@link #IO_THREADS} remote-storage reads can be in flight at once. Within
+     * a source the reads stay ascending, preserving read-ahead friendliness.
+     *
+     * <p>This matters for graphs backed by remote storage (e.g. an object
+     * store): there each {@code getVectorInto} is a network round-trip with no
+     * OS read-ahead, so a single-threaded loop over thousands of samples
+     * serializes thousands of round-trips. Reading sources in parallel hides
+     * that latency. The returned list order is unspecified — irrelevant, since
+     * it only feeds {@link ProductQuantization#compute} as an unordered
+     * training set.
      */
     private List<VectorFloat<?>> extractVectorsSequential(List<SampleRef> samples) {
-        OnDiskGraphIndex.View[] views = new OnDiskGraphIndex.View[sources.size()];
-        for (int s = 0; s < sources.size(); s++) {
-            views[s] = (OnDiskGraphIndex.View) sources.get(s).getView();
+        if (samples.isEmpty()) {
+            return new ArrayList<>();
         }
 
-        List<VectorFloat<?>> vectors = new ArrayList<>(samples.size());
-        VectorFloat<?> tmp = vectorTypeSupport.createFloatVector(dimension);
+        // Group the pre-sorted samples by source. The caller sorted by
+        // (source, node) so each source's sub-list is contiguous and ascending.
+        Map<Integer, List<SampleRef>> bySource = new LinkedHashMap<>();
         for (SampleRef ref : samples) {
-            views[ref.source].getVectorInto(ref.node, tmp, 0);
-            vectors.add(tmp.copy());
+            bySource.computeIfAbsent(ref.source, k -> new ArrayList<>()).add(ref);
         }
+
+        int parallelism = Math.min(bySource.size(), IO_THREADS);
+        // Order is irrelevant for PQ codebook training, so a synchronized list
+        // collecting from all workers is sufficient.
+        List<VectorFloat<?>> vectors =
+                Collections.synchronizedList(new ArrayList<>(samples.size()));
+        AtomicInteger progress = new AtomicInteger();
+        int totalSamples = samples.size();
+        long startNanos = System.nanoTime();
+
+        ExecutorService pool = Executors.newFixedThreadPool(parallelism, r -> {
+            Thread t = new Thread(r, "pq-retrain-io");
+            t.setDaemon(true);
+            return t;
+        });
+        try {
+            List<Future<?>> futures = new ArrayList<>(bySource.size());
+            for (Map.Entry<Integer, List<SampleRef>> entry : bySource.entrySet()) {
+                final int source = entry.getKey();
+                final List<SampleRef> group = entry.getValue();
+                futures.add(pool.submit(() -> {
+                    // One View — and one RandomAccessReader — per task. Never
+                    // shared across threads, so concurrent extraction is safe.
+                    OnDiskGraphIndex.View view =
+                            (OnDiskGraphIndex.View) sources.get(source).getView();
+                    try {
+                        VectorFloat<?> scratch = vectorTypeSupport.createFloatVector(dimension);
+                        for (SampleRef ref : group) {
+                            view.getVectorInto(ref.node, scratch, 0);
+                            vectors.add(scratch.copy());
+                            int done = progress.incrementAndGet();
+                            if (done % PROGRESS_LOG_INTERVAL == 0) {
+                                log.info("PQ retraining: extracted {}/{} training vectors",
+                                        done, totalSamples);
+                            }
+                        }
+                    } finally {
+                        try {
+                            view.close();
+                        } catch (IOException ioe) {
+                            log.warn("Failed to close source {} view during PQ retraining",
+                                    source, ioe);
+                        }
+                    }
+                }));
+            }
+            // Wait for completion; surface the first failure.
+            for (Future<?> f : futures) {
+                try {
+                    f.get();
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw new RuntimeException("PQ retraining vector extraction interrupted", ie);
+                } catch (ExecutionException ee) {
+                    throw new RuntimeException("PQ retraining vector extraction failed",
+                            ee.getCause());
+                }
+            }
+        } finally {
+            pool.shutdownNow();
+        }
+
+        log.info("PQ retraining: extracted {} training vectors from {} sources in {} ms ({} threads)",
+                vectors.size(), bySource.size(),
+                (System.nanoTime() - startNanos) / 1_000_000L, parallelism);
         return vectors;
     }
 
