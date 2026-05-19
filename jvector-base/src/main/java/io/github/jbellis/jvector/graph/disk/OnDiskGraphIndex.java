@@ -455,6 +455,23 @@ public class OnDiskGraphIndex implements ImmutableGraphIndex, AutoCloseable, Acc
         }
     }
 
+    /**
+     * Opens a {@link View} backed by a caller-supplied {@link ReaderSupplier} instead of the
+     * index's own internal reader. This allows callers that have already downloaded or buffered
+     * the index file locally (e.g. for bulk vector extraction during PQ retraining) to avoid
+     * routing reads through the block cache.
+     *
+     * <p>The caller is responsible for closing the returned View (which closes the underlying
+     * reader) and for separately closing the {@code supplier} when it is no longer needed.
+     *
+     * @param supplier the reader supplier to use; {@code supplier.get()} is called exactly once
+     * @return a new View backed by the provided reader
+     * @throws IOException if {@code supplier.get()} throws
+     */
+    public View getView(ReaderSupplier supplier) throws IOException {
+        return new View(supplier.get());
+    }
+
     @Override
     public double getAverageDegree(int level) {
         var view = this.getView();

@@ -25,7 +25,9 @@ import java.nio.channels.FileChannel;
 import java.nio.file.StandardOpenOption;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.function.Function;
 import java.util.stream.IntStream;
+import io.github.jbellis.jvector.disk.ReaderSupplier;
 import io.github.jbellis.jvector.graph.*;
 import io.github.jbellis.jvector.graph.disk.feature.Feature;
 import io.github.jbellis.jvector.graph.disk.feature.FeatureId;
@@ -71,10 +73,19 @@ public final class OnDiskGraphIndexCompactor implements Accountable {
     private final ForkJoinPool executor;
     private final int taskWindowSize;
     private final VectorSimilarityFunction similarityFunction;
+    /**
+     * Optional factory for bulk sequential readers used during PQ retraining.
+     * When non-null, {@link #resolvePQFromSources} passes it to {@link PQRetrainer}
+     * so that training-vector extraction avoids per-node block-cache round-trips
+     * (issue #599 Option B). {@code null} uses the default block-cache path.
+     */
+    private final Function<OnDiskGraphIndex, ReaderSupplier> readerSupplierFactory;
 
     /**
      * Constructs a new OnDiskGraphIndexCompactor to merge multiple graph indexes.
-     * Initializes thread pool, validates inputs, and prepares metadata for compaction.
+     * Uses the default block-cache path for PQ retraining vector extraction.
+     *
+     * @see #OnDiskGraphIndexCompactor(List, List, List, VectorSimilarityFunction, ForkJoinPool, Function)
      */
     public OnDiskGraphIndexCompactor(
             List<OnDiskGraphIndex> sources,
@@ -82,6 +93,27 @@ public final class OnDiskGraphIndexCompactor implements Accountable {
             List<OrdinalMapper> remappers,
             VectorSimilarityFunction similarityFunction,
             ForkJoinPool executor) {
+        this(sources, liveNodes, remappers, similarityFunction, executor, null);
+    }
+
+    /**
+     * Constructs a new OnDiskGraphIndexCompactor to merge multiple graph indexes,
+     * with an optional reader-supplier factory for bulk PQ retraining I/O.
+     *
+     * @param readerSupplierFactory when non-null, called once per source segment
+     *                              during PQ retraining to obtain a
+     *                              {@link ReaderSupplier} backed by a pre-downloaded
+     *                              or locally-buffered copy of the index file; avoids
+     *                              per-node block-cache round-trips (issue #599
+     *                              Option B); pass {@code null} for the default path
+     */
+    public OnDiskGraphIndexCompactor(
+            List<OnDiskGraphIndex> sources,
+            List<FixedBitSet> liveNodes,
+            List<OrdinalMapper> remappers,
+            VectorSimilarityFunction similarityFunction,
+            ForkJoinPool executor,
+            Function<OnDiskGraphIndex, ReaderSupplier> readerSupplierFactory) {
         checkBeforeCompact(sources, liveNodes, remappers);
 
         int threads = Runtime.getRuntime().availableProcessors();
@@ -112,6 +144,7 @@ public final class OnDiskGraphIndexCompactor implements Accountable {
             maxOrdinal = max(mapper.maxOrdinal(), maxOrdinal);
         }
         this.similarityFunction = similarityFunction;
+        this.readerSupplierFactory = readerSupplierFactory;
     }
 
     /**
@@ -971,7 +1004,9 @@ public final class OnDiskGraphIndexCompactor implements Accountable {
      * indexes. This ensures the PQ is optimized for the combined dataset.
      */
     private ProductQuantization resolvePQFromSources(VectorSimilarityFunction similarityFunction) {
-        PQRetrainer retrainer = new PQRetrainer(sources, liveNodes, dimension);
+        // Pass the reader-supplier factory so PQRetrainer can open bulk sequential readers
+        // instead of per-node block-cache reads when remote storage is involved (issue #599).
+        PQRetrainer retrainer = new PQRetrainer(sources, liveNodes, dimension, readerSupplierFactory);
         return retrainer.retrain(similarityFunction);
     }
 
