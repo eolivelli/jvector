@@ -16,6 +16,7 @@
 
 package io.github.jbellis.jvector.graph.disk;
 
+import io.github.jbellis.jvector.disk.ReaderSupplier;
 import io.github.jbellis.jvector.graph.ListRandomAccessVectorValues;
 import io.github.jbellis.jvector.graph.disk.feature.FeatureId;
 import io.github.jbellis.jvector.graph.disk.feature.FusedPQ;
@@ -42,6 +43,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Function;
 
 /**
  * Handles Product Quantization retraining for graph index compaction.
@@ -74,11 +76,44 @@ public class PQRetrainer {
     private final List<Integer> numLiveNodesPerSource;
     private final int dimension;
     private final int numTotalNodes;
+    /**
+     * Optional factory that, given a source {@link OnDiskGraphIndex}, returns a
+     * {@link ReaderSupplier} backed by a pre-downloaded or locally-buffered copy of
+     * the index file. When non-null, {@link #extractVectorsSequential} uses it to
+     * open Views via {@link OnDiskGraphIndex#getView(ReaderSupplier)} instead of the
+     * default {@link OnDiskGraphIndex#getView()}, avoiding per-node block-cache reads
+     * over remote storage (issue #599 Option B).
+     *
+     * <p>The factory may throw {@link RuntimeException} (including
+     * {@link java.io.UncheckedIOException}) on failure; such exceptions surface as
+     * the existing {@code RuntimeException("PQ retraining vector extraction failed")}
+     * wrapper.
+     */
+    private final Function<OnDiskGraphIndex, ReaderSupplier> readerSupplierFactory;
 
+    /**
+     * Constructs a {@code PQRetrainer} without a custom reader-supplier factory.
+     * Vector extraction uses the default {@link OnDiskGraphIndex#getView()}, which
+     * routes reads through the block cache.
+     */
     public PQRetrainer(List<OnDiskGraphIndex> sources, List<FixedBitSet> liveNodes, int dimension) {
+        this(sources, liveNodes, dimension, null);
+    }
+
+    /**
+     * Constructs a {@code PQRetrainer} with an optional reader-supplier factory.
+     *
+     * @param readerSupplierFactory when non-null, called once per source segment to
+     *                              obtain a {@link ReaderSupplier} for bulk sequential
+     *                              reads; the returned supplier is closed after all
+     *                              vectors for that source are extracted
+     */
+    public PQRetrainer(List<OnDiskGraphIndex> sources, List<FixedBitSet> liveNodes, int dimension,
+                       Function<OnDiskGraphIndex, ReaderSupplier> readerSupplierFactory) {
         this.sources = sources;
         this.liveNodes = liveNodes;
         this.dimension = dimension;
+        this.readerSupplierFactory = readerSupplierFactory;
 
         this.numLiveNodesPerSource = new ArrayList<>(sources.size());
         int total = 0;
@@ -270,8 +305,30 @@ public class PQRetrainer {
                 futures.add(pool.submit(() -> {
                     // One View — and one RandomAccessReader — per task. Never
                     // shared across threads, so concurrent extraction is safe.
-                    OnDiskGraphIndex.View view =
-                            (OnDiskGraphIndex.View) sources.get(source).getView();
+                    //
+                    // When a readerSupplierFactory is present, use it to open a View
+                    // backed by a pre-downloaded or locally-buffered copy of the index
+                    // file instead of the default block-cache reader. This eliminates
+                    // per-node remote-storage round-trips (issue #599 Option B).
+                    final OnDiskGraphIndex odg = sources.get(source);
+                    final ReaderSupplier supplierForSource;
+                    final OnDiskGraphIndex.View view;
+                    if (readerSupplierFactory != null) {
+                        supplierForSource = readerSupplierFactory.apply(odg);
+                        try {
+                            view = odg.getView(supplierForSource);
+                        } catch (IOException e) {
+                            try {
+                                supplierForSource.close();
+                            } catch (IOException suppressed) {
+                                e.addSuppressed(suppressed);
+                            }
+                            throw new java.io.UncheckedIOException(e);
+                        }
+                    } else {
+                        supplierForSource = null;
+                        view = (OnDiskGraphIndex.View) odg.getView();
+                    }
                     try {
                         VectorFloat<?> scratch = vectorTypeSupport.createFloatVector(dimension);
                         for (SampleRef ref : group) {
@@ -289,6 +346,14 @@ public class PQRetrainer {
                         } catch (IOException ioe) {
                             log.warn("Failed to close source {} view during PQ retraining",
                                     source, ioe);
+                        }
+                        if (supplierForSource != null) {
+                            try {
+                                supplierForSource.close();
+                            } catch (IOException ioe) {
+                                log.warn("Failed to close bulk reader supplier for source {} during PQ retraining",
+                                        source, ioe);
+                            }
                         }
                     }
                 }));
