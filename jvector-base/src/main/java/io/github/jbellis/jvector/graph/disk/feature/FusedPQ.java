@@ -44,6 +44,7 @@ public class FusedPQ extends AbstractFeature implements FusedFeature {
     private final ProductQuantization pq;
     private final int maxDegree;
     private final ThreadLocal<VectorFloat<?>> reusableResults;
+    private final ThreadLocal<VectorFloat<?>> reusableCenteredQuery;
     private final ExplicitThreadLocal<ByteSequence<?>> reusableNeighborCodes;
     private final ExplicitThreadLocal<ByteSequence<?>> pqCodeScratch;
 
@@ -54,6 +55,7 @@ public class FusedPQ extends AbstractFeature implements FusedFeature {
         this.maxDegree = maxDegree;
         this.pq = pq;
         this.reusableResults = ThreadLocal.withInitial(() -> vectorTypeSupport.createFloatVector(maxDegree));
+        this.reusableCenteredQuery = ThreadLocal.withInitial(() -> vectorTypeSupport.createFloatVector(pq.getOriginalDimension()));
         this.reusableNeighborCodes = ExplicitThreadLocal.withInitial(() -> vectorTypeSupport.createByteSequence(pq.compressedVectorSize() * maxDegree));
         this.pqCodeScratch = ExplicitThreadLocal.withInitial(() -> vectorTypeSupport.createByteSequence(pq.compressedVectorSize()));
     }
@@ -93,7 +95,7 @@ public class FusedPQ extends AbstractFeature implements FusedFeature {
     public ScoreFunction.ApproximateScoreFunction approximateScoreFunctionFor(VectorFloat<?> queryVector, VectorSimilarityFunction vsf, OnDiskGraphIndex.View view, ScoreFunction.ExactScoreFunction esf) {
         var neighbors = new PackedNeighbors(view);
         var hierarchyCachedFeatures = view.getInlineSourceFeatures();
-        return FusedPQDecoder.newDecoder(neighbors, pq, hierarchyCachedFeatures, queryVector, reusableNeighborCodes.get(), reusableResults.get(), vsf, esf);
+        return FusedPQDecoder.newDecoder(neighbors, pq, hierarchyCachedFeatures, queryVector, reusableNeighborCodes.get(), reusableResults.get(), reusableCenteredQuery.get(), vsf, esf);
     }
 
     @Override

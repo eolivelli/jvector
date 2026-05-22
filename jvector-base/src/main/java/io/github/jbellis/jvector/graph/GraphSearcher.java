@@ -69,6 +69,12 @@ public class GraphSearcher implements Closeable {
     private boolean pruneSearch;
     private boolean asyncPipelineEnabled;
     private final ScoreTracker.ScoreTrackerFactory scoreTrackerFactory;
+    private ScoreTracker scoreTracker;
+
+    // Reusable callbacks for view.processNeighbors so we don't allocate a fresh
+    // lambda / bound method-reference for every candidate popped from the heap.
+    private final ImmutableGraphIndex.IntMarker visitedAdder;
+    private final ImmutableGraphIndex.NeighborProcessor neighborProcessor;
 
     private int visitedCount;
     private int expandedCount;
@@ -94,6 +100,12 @@ public class GraphSearcher implements Closeable {
 
         this.pruneSearch = true;
         this.scoreTrackerFactory = new ScoreTracker.ScoreTrackerFactory();
+        this.visitedAdder = visited::add;
+        this.neighborProcessor = (node2, score) -> {
+            scoreTracker.track(score);
+            candidates.push(node2, score);
+            visitedCount++;
+        };
     }
 
     protected int getVisitedCount() {
@@ -453,7 +465,7 @@ public class GraphSearcher implements Closeable {
             approximateResults.setMaxSize(rerankK);
 
             // track scores to predict when we are done with threshold queries
-            var scoreTracker = scoreTrackerFactory.getScoreTracker(pruneSearch, rerankK, threshold);
+            this.scoreTracker = scoreTrackerFactory.getScoreTracker(pruneSearch, rerankK, threshold);
 
             // the main search loop
             while (candidates.size() > 0) {
@@ -480,12 +492,7 @@ public class GraphSearcher implements Closeable {
 
                 // score the neighbors of the top candidate and add them to the queue
                 var scoreFunction = scoreProvider.scoreFunction();
-                ImmutableGraphIndex.NeighborProcessor neighborProcessor = (node2, score) -> {
-                    scoreTracker.track(score);
-                    candidates.push(node2, score);
-                    visitedCount++;
-                };
-                view.processNeighbors(level, topCandidateNode, scoreFunction, visited::add, neighborProcessor);
+                view.processNeighbors(level, topCandidateNode, scoreFunction, visitedAdder, neighborProcessor);
             }
         } catch (Throwable t) {
             // clear scratch structures if terminated via throwable, as they may not have been drained
