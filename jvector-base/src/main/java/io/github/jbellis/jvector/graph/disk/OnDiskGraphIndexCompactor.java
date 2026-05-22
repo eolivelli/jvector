@@ -19,8 +19,8 @@ package io.github.jbellis.jvector.graph.disk;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.UncheckedIOException;
+
 import java.nio.file.Path;
-import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.StandardOpenOption;
 import java.util.*;
@@ -419,27 +419,18 @@ public final class OnDiskGraphIndexCompactor implements Accountable {
 
                     var wropts = EnumSet.of(StandardOpenOption.WRITE, StandardOpenOption.READ);
                     try (FileChannel fc = FileChannel.open(writer.getOutputPath(), wropts)) {
-
-                        runBatchesWithBackpressure(
-                                batches,
-                                ecs,
-                                submitOne,
-                                (results) -> {
-                                    try {
-                                        for (WriteResult r : results) {
-                                            ByteBuffer b = r.data;
-                                            long pos = r.fileOffset;
-                                            while (b.hasRemaining()) {
-                                                int n = fc.write(b, pos);
-                                                pos += n;
-                                            }
-                                        }
-                                    } catch (IOException e) {
-                                        throw new UncheckedIOException(e);
-                                    }
-                                },
-                                progressListener
-                        );
+                        writer.setInlineChannel(fc);
+                        try {
+                            runBatchesWithBackpressure(
+                                    batches,
+                                    ecs,
+                                    submitOne,
+                                    (results) -> { /* records were written directly by workers */ },
+                                    progressListener
+                            );
+                        } finally {
+                            writer.setInlineChannel(null);
+                        }
                     }
 
                     writer.offsetAfterInline();
@@ -705,6 +696,7 @@ public final class OnDiskGraphIndexCompactor implements Accountable {
         return writer.writeInlineNodeRecord(
                 newOrdinal,
                 scratch.baseVec,
+                scratch.tmpVec,
                 selected,
                 scratch.pqCode
         );
@@ -1225,12 +1217,10 @@ public final class OnDiskGraphIndexCompactor implements Accountable {
     static final class WriteResult {
         final int newOrdinal;
         final long fileOffset;
-        final ByteBuffer data;
 
-        WriteResult(int newOrdinal, long fileOffset, ByteBuffer data) {
+        WriteResult(int newOrdinal, long fileOffset) {
             this.newOrdinal = newOrdinal;
             this.fileOffset = fileOffset;
-            this.data = data;
         }
     };
 
