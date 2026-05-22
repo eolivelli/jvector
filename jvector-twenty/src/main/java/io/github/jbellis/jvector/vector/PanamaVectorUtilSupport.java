@@ -16,6 +16,7 @@
 
 package io.github.jbellis.jvector.vector;
 
+import io.github.jbellis.jvector.util.ExplicitThreadLocal;
 import io.github.jbellis.jvector.util.MathUtil;
 import io.github.jbellis.jvector.vector.types.ByteSequence;
 import io.github.jbellis.jvector.vector.types.VectorFloat;
@@ -40,8 +41,8 @@ class PanamaVectorUtilSupport implements VectorUtilSupport {
     static final IntVector BYTE_TO_INT_MASK_512 = IntVector.broadcast(IntVector.SPECIES_512, 0xff);
     static final IntVector BYTE_TO_INT_MASK_256 = IntVector.broadcast(IntVector.SPECIES_256, 0xff);
 
-    static final ThreadLocal<int[]> scratchInt512 = ThreadLocal.withInitial(() -> new int[IntVector.SPECIES_512.length()]);
-    static final ThreadLocal<int[]> scratchInt256 = ThreadLocal.withInitial(() -> new int[IntVector.SPECIES_256.length()]);
+    static final ExplicitThreadLocal<int[]> scratchInt512 = ExplicitThreadLocal.withInitial(() -> new int[IntVector.SPECIES_512.length()]);
+    static final ExplicitThreadLocal<int[]> scratchInt256 = ExplicitThreadLocal.withInitial(() -> new int[IntVector.SPECIES_256.length()]);
 
     protected FloatVector fromVectorFloat(VectorSpecies<Float> SPEC, VectorFloat<?> vector, int offset) {
         if (vector instanceof BufferVectorFloat bv) {
