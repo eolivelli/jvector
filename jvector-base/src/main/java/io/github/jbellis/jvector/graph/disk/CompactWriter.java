@@ -19,6 +19,7 @@ package io.github.jbellis.jvector.graph.disk;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.nio.channels.FileChannel;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -66,6 +67,7 @@ final class CompactWriter implements AutoCloseable {
     private final ThreadLocal<ByteSequence<?>> zeroPQ;
     private final boolean fusedPQEnabled;
     private final Path outputPath;
+    private volatile FileChannel inlineChannel;
     private final List<CommonHeader.LayerInfo> configuredLayerInfo;
     private final List<Integer> configuredLayerDegrees;
     private final List<UpperLayerFeatureRecord> level1FeatureRecords;
@@ -174,6 +176,16 @@ final class CompactWriter implements AutoCloseable {
         return outputPath;
     }
 
+    /**
+     * Sets the {@link FileChannel} that {@link #writeInlineNodeRecord} will write base-layer
+     * records into directly from worker threads. Must be set before the first call to
+     * {@code writeInlineNodeRecord}; clear by passing {@code null} once the level-0 phase
+     * is finished. Lifetime of the channel is managed by the caller.
+     */
+    public void setInlineChannel(FileChannel fc) {
+        this.inlineChannel = fc;
+    }
+
     public void setEntryNodePqCode(ByteSequence<?> code) {
         this.entryNodePqCode = code;
     }
@@ -200,7 +212,7 @@ final class CompactWriter implements AutoCloseable {
         writer.flush();
     }
 
-    public WriteResult writeInlineNodeRecord(int ordinal, VectorFloat<?> vec, SelectedVecCache selectedCache, ByteSequence<?> pqCode) throws IOException
+    public WriteResult writeInlineNodeRecord(int ordinal, VectorFloat<?> vec, VectorFloat<?> encodeScratch, SelectedVecCache selectedCache, ByteSequence<?> pqCode) throws IOException
     {
         var bwriter = new ByteBufferIndexWriter(bufferPerThread.get());
 
@@ -219,7 +231,7 @@ final class CompactWriter implements AutoCloseable {
             int k = 0;
             for (; k < selectedCache.size; k++) {
                 pqCode.zero();
-                pq.encodeTo(selectedCache.vecs[k], pqCode);
+                pq.encodeTo(selectedCache.vecs[k], encodeScratch, pqCode);
                 vectorTypeSupport.writeByteSequence(bwriter, pqCode);
             }
             for (; k < baseDegree; k++) {
@@ -245,9 +257,18 @@ final class CompactWriter implements AutoCloseable {
                             ordinal, recordSize, bwriter.bytesWritten(), baseDegree));
         }
 
-        ByteBuffer dataCopy = bwriter.cloneBuffer();
+        FileChannel fc = inlineChannel;
+        if (fc == null) {
+            throw new IllegalStateException("inline channel not set; call setInlineChannel before writeInlineNodeRecord");
+        }
+        ByteBuffer buf = bufferPerThread.get();
+        buf.position(0).limit(recordSize);
+        long pos = fileOffset;
+        while (buf.hasRemaining()) {
+            pos += fc.write(buf, pos);
+        }
 
-        return new WriteResult(ordinal, fileOffset, dataCopy);
+        return new WriteResult(ordinal, fileOffset);
     }
 
     static final class UpperLayerFeatureRecord {

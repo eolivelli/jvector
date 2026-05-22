@@ -435,8 +435,23 @@ public class ProductQuantization implements VectorCompressor<ByteSequence<?>>, A
 
     @Override
     public void encodeTo(VectorFloat<?> vector, ByteSequence<?> dest) {
+        encodeTo(vector, null, dest);
+    }
+
+    /**
+     * Allocation-free variant of {@link #encodeTo(VectorFloat, ByteSequence)}: when a global
+     * centroid is configured, the centered vector is written into {@code scratch} (which must
+     * have at least {@code vector.length()} components) rather than into a freshly allocated
+     * buffer. Pass {@code null} for {@code scratch} to fall back to the allocating path.
+     */
+    public void encodeTo(VectorFloat<?> vector, VectorFloat<?> scratch, ByteSequence<?> dest) {
         if (globalCentroid != null) {
-            vector = sub(vector, globalCentroid);
+            if (scratch == null) {
+                vector = sub(vector, globalCentroid);
+            } else {
+                VectorUtil.subInto(scratch, vector, globalCentroid);
+                vector = scratch;
+            }
         }
 
         if (anisotropicThreshold > UNWEIGHTED)
