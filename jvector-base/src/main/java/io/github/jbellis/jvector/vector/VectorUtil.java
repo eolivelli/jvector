@@ -150,6 +150,15 @@ public final class VectorUtil {
     return impl.sub(lhs, rhs);
   }
 
+  /**
+   * Compute {@code lhs - rhs} into {@code dest} without allocating a new vector.
+   * {@code dest} must have at least {@code lhs.length()} slots; its existing contents are overwritten.
+   */
+  public static void subInto(VectorFloat<?> dest, VectorFloat<?> lhs, VectorFloat<?> rhs) {
+    dest.copyFrom(lhs, 0, 0, lhs.length());
+    impl.subInPlace(dest, rhs);
+  }
+
   public static VectorFloat<?> sub(VectorFloat<?> lhs, float value) {
     return impl.sub(lhs, value);
   }

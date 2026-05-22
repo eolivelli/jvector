@@ -49,7 +49,8 @@ public abstract class FusedPQDecoder implements ScoreFunction.ApproximateScoreFu
     protected FusedPQDecoder(ProductQuantization pq,
                              Int2ObjectHashMap<FusedFeature.InlineSource> hierarchyCachedFeatures,
                              VectorFloat<?> query, FusedPQ.PackedNeighbors packedNeighbors,
-                             ByteSequence<?> neighborCodes, VectorFloat<?> results, ExactScoreFunction esf,
+                             ByteSequence<?> neighborCodes, VectorFloat<?> results,
+                             VectorFloat<?> reusableCenteredQuery, ExactScoreFunction esf,
                              VectorSimilarityFunction vsf) {
         this.pq = pq;
         this.hierarchyCachedFeatures = hierarchyCachedFeatures;
@@ -66,7 +67,13 @@ public abstract class FusedPQDecoder implements ScoreFunction.ApproximateScoreFu
         partialSums = pq.reusablePartialSums();
         if (vsf != VectorSimilarityFunction.COSINE) {
             VectorFloat<?> center = pq.globalCentroid;
-            var centeredQuery = center == null ? query : VectorUtil.sub(query, center);
+            VectorFloat<?> centeredQuery;
+            if (center == null) {
+                centeredQuery = query;
+            } else {
+                centeredQuery = reusableCenteredQuery;
+                VectorUtil.subInto(centeredQuery, query, center);
+            }
             for (var i = 0; i < pq.getSubspaceCount(); i++) {
                 int offset = pq.subvectorSizesAndOffsets[i][1];
                 int size = pq.subvectorSizesAndOffsets[i][0];
@@ -124,8 +131,8 @@ public abstract class FusedPQDecoder implements ScoreFunction.ApproximateScoreFu
         public DotProductDecoder(FusedPQ.PackedNeighbors neighbors, ProductQuantization pq,
                                  Int2ObjectHashMap<FusedFeature.InlineSource> hierarchyCachedFeatures,
                                  VectorFloat<?> query, ByteSequence<?> neighborCodes, VectorFloat<?> results,
-                                 ExactScoreFunction esf) {
-            super(pq, hierarchyCachedFeatures, query, neighbors, neighborCodes, results, esf, VectorSimilarityFunction.DOT_PRODUCT);
+                                 VectorFloat<?> reusableCenteredQuery, ExactScoreFunction esf) {
+            super(pq, hierarchyCachedFeatures, query, neighbors, neighborCodes, results, reusableCenteredQuery, esf, VectorSimilarityFunction.DOT_PRODUCT);
         }
 
         @Override
@@ -138,8 +145,8 @@ public abstract class FusedPQDecoder implements ScoreFunction.ApproximateScoreFu
         public EuclideanDecoder(FusedPQ.PackedNeighbors neighbors, ProductQuantization pq,
                                 Int2ObjectHashMap<FusedFeature.InlineSource> hierarchyCachedFeatures,
                                 VectorFloat<?> query, ByteSequence<?> neighborCodes, VectorFloat<?> results,
-                                ExactScoreFunction esf) {
-            super(pq, hierarchyCachedFeatures, query, neighbors, neighborCodes, results, esf, VectorSimilarityFunction.EUCLIDEAN);
+                                VectorFloat<?> reusableCenteredQuery, ExactScoreFunction esf) {
+            super(pq, hierarchyCachedFeatures, query, neighbors, neighborCodes, results, reusableCenteredQuery, esf, VectorSimilarityFunction.EUCLIDEAN);
         }
 
         @Override
@@ -158,8 +165,8 @@ public abstract class FusedPQDecoder implements ScoreFunction.ApproximateScoreFu
         protected CosineDecoder(FusedPQ.PackedNeighbors neighbors, ProductQuantization pq,
                                 Int2ObjectHashMap<FusedFeature.InlineSource> hierarchyCachedFeatures,
                                 VectorFloat<?> query, ByteSequence<?> neighborCodes, VectorFloat<?> results,
-                                ExactScoreFunction esf) {
-            super(pq, hierarchyCachedFeatures, query, neighbors, neighborCodes, results, esf, VectorSimilarityFunction.COSINE);
+                                VectorFloat<?> reusableCenteredQuery, ExactScoreFunction esf) {
+            super(pq, hierarchyCachedFeatures, query, neighbors, neighborCodes, results, reusableCenteredQuery, esf, VectorSimilarityFunction.COSINE);
 
             // this part is not query-dependent, so we can cache it
             partialSquaredMagnitudes = pq.partialSquaredMagnitudes().updateAndGet(current -> {
@@ -186,7 +193,13 @@ public abstract class FusedPQDecoder implements ScoreFunction.ApproximateScoreFu
             // compute partialSums
             VectorFloat<?> center = pq.globalCentroid;
             float queryMagSum = 0.0f;
-            var centeredQuery = center == null ? query : VectorUtil.sub(query, center);
+            VectorFloat<?> centeredQuery;
+            if (center == null) {
+                centeredQuery = query;
+            } else {
+                centeredQuery = reusableCenteredQuery;
+                VectorUtil.subInto(centeredQuery, query, center);
+            }
             for (var i = 0; i < pq.getSubspaceCount(); i++) {
                 int offset = pq.subvectorSizesAndOffsets[i][1];
                 int size = pq.subvectorSizesAndOffsets[i][0];
@@ -229,14 +242,15 @@ public abstract class FusedPQDecoder implements ScoreFunction.ApproximateScoreFu
     public static FusedPQDecoder newDecoder(FusedPQ.PackedNeighbors neighbors, ProductQuantization pq,
                                             Int2ObjectHashMap<FusedFeature.InlineSource> hierarchyCachedFeatures, VectorFloat<?> query,
                                             ByteSequence<?> reusableNeighborCodes, VectorFloat<?> results,
+                                            VectorFloat<?> reusableCenteredQuery,
                                             VectorSimilarityFunction similarityFunction, ExactScoreFunction esf) {
         switch (similarityFunction) {
             case DOT_PRODUCT:
-                return new DotProductDecoder(neighbors, pq, hierarchyCachedFeatures, query, reusableNeighborCodes, results, esf);
+                return new DotProductDecoder(neighbors, pq, hierarchyCachedFeatures, query, reusableNeighborCodes, results, reusableCenteredQuery, esf);
             case EUCLIDEAN:
-                return new EuclideanDecoder(neighbors, pq, hierarchyCachedFeatures, query, reusableNeighborCodes, results, esf);
+                return new EuclideanDecoder(neighbors, pq, hierarchyCachedFeatures, query, reusableNeighborCodes, results, reusableCenteredQuery, esf);
             case COSINE:
-                return new CosineDecoder(neighbors, pq, hierarchyCachedFeatures, query, reusableNeighborCodes, results, esf);
+                return new CosineDecoder(neighbors, pq, hierarchyCachedFeatures, query, reusableNeighborCodes, results, reusableCenteredQuery, esf);
             default:
                 throw new IllegalArgumentException("Unsupported similarity function: " + similarityFunction);
         }
